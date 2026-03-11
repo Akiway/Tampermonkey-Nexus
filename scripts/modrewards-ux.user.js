@@ -2,11 +2,11 @@
 // @name         Nexus ModRewards UX Enhancer
 // @namespace    https://github.com/Akiway
 // @author       Akiway
-// @version      1.1.1
+// @version      1.2.0
 // @description  Adds sortable columns, mod links, extra fields, totals on reports, and wallet enhancements.
 // @match        https://www.nexusmods.com/modrewards*
-// @updateURL    https://github.com/Akiway/Tampermonkey-Nexus/blob/main/scripts/modrewards-ux.user.js
-// @downloadURL	 https://github.com/Akiway/Tampermonkey-Nexus/blob/main/scripts/modrewards-ux.user.js
+// @updateURL    https://github.com/Akiway/Tampermonkey-Nexus/raw/refs/heads/main/scripts/modrewards-ux.user.js
+// @downloadURL	 https://github.com/Akiway/Tampermonkey-Nexus/raw/refs/heads/main/scripts/modrewards-ux.user.js
 // @run-at       document-start
 // @grant        none
 // ==/UserScript==
@@ -17,12 +17,14 @@
   const GAME_SLUG = "cyberpunk2077";
   const MOD_ENTRIES_URL_FRAGMENT = "/Core/Libs/Common/Managers/ModRewards?GetEntries";
   const MOD_SUMMARY_URL_FRAGMENT = "/Core/Libs/Common/Managers/ModRewards?GetSummary";
-  const CUTOFF_YEAR = 2024;
-  const CUTOFF_MONTH = 5;
   const STYLE_ID = "tm-modrewards-ux-style";
   const NOTICE_ID = "tm-modrewards-notice";
   const LINK_CLASS = "tm-mod-link";
   const TOTAL_ROW_ATTR = "data-tm-total-row";
+  const REPORT_MODE_ATTR = "data-tm-report-mode";
+  const REPORT_MODE_I20 = "i20";
+  const REPORT_MODE_UNIQUE = "unique";
+  const UNIQUE_RATIO_ATTR = "data-tm-unique-has-ratio";
   const WALLET_SEPARATOR_ATTR = "data-tm-wallet-separator";
   const WALLET_SEPARATOR_TEXT = "Beginning of the new Donation Point System.";
   const EXTRA_COLUMNS = [
@@ -38,6 +40,7 @@
   const modIdByName = new Map();
   const modIdByNameAndGame = new Map();
   const entryDataByNameAndGame = new Map();
+  const reportTypeByYearAndMonth = new Map();
   const summaryDataByYearAndMonth = new Map();
   const sortState = { index: -1, direction: "asc" };
 
@@ -110,16 +113,7 @@
       return false;
     }
 
-    const parsed = parseYearAndMonthFromHash();
-    if (!parsed) {
-      return false;
-    }
-
-    if (parsed.year > CUTOFF_YEAR) {
-      return true;
-    }
-
-    return parsed.year === CUTOFF_YEAR && parsed.month > CUTOFF_MONTH;
+    return Boolean(parseYearAndMonthFromHash());
   }
 
   function getStoreList() {
@@ -155,6 +149,108 @@
     }
 
     return Array.from(entry.children).filter((child) => child.tagName === "SPAN");
+  }
+
+  function getBaseHeaderCells(header) {
+    return Array.from(header.children).filter(
+      (child) =>
+        child.classList &&
+        child.classList.contains("report_entry_head--title") &&
+        !child.dataset.tmExtraCol,
+    );
+  }
+
+  function detectReportModeFromHeader() {
+    const header = document.querySelector("ul.store-items .report_entry_head");
+    if (!header) {
+      return REPORT_MODE_I20;
+    }
+
+    const headerNames = getBaseHeaderCells(header).map((cell) => normalizeText(cell.textContent));
+    const hasRatioColumn = headerNames.some((text) => text.includes("ratio"));
+    if (hasRatioColumn) {
+      return REPORT_MODE_I20;
+    }
+
+    const hasUniqueColumn = headerNames.some(
+      (text) => (text.includes("unique") && text.includes("download")) || text.includes("unique dl"),
+    );
+    const hasModRewardsColumn = headerNames.some(
+      (text) =>
+        (text.includes("mod") && text.includes("reward")) ||
+        (text.includes("mod") && text.includes("dp")),
+    );
+    const hasYourRewardColumn = headerNames.some(
+      (text) =>
+        (text.includes("your") && text.includes("reward")) ||
+        (text.includes("your") && text.includes("dp")),
+    );
+
+    if (hasUniqueColumn && hasModRewardsColumn && hasYourRewardColumn) {
+      return REPORT_MODE_UNIQUE;
+    }
+
+    return REPORT_MODE_I20;
+  }
+
+  function getCurrentReportMode() {
+    const parsed = parseYearAndMonthFromHash();
+    if (parsed) {
+      const reportType = reportTypeByYearAndMonth.get(makeYearAndMonthKey(parsed.year, parsed.month));
+      if (reportType === "UNIQUE_DOWNLOADS") {
+        return REPORT_MODE_UNIQUE;
+      }
+      if (reportType === "I20_GAME_POOLS") {
+        return REPORT_MODE_I20;
+      }
+    }
+
+    return detectReportModeFromHeader();
+  }
+
+  function findUniqueColumnIndexes(header) {
+    const indexes = {
+      modCount: -1,
+      modValue: -1,
+      value: -1,
+      ratio: -1,
+    };
+
+    const headerCells = getBaseHeaderCells(header);
+    for (const [index, cell] of headerCells.entries()) {
+      const label = normalizeText(cell.textContent);
+      if (
+        indexes.modCount < 0 &&
+        ((label.includes("unique") && label.includes("download")) || label.includes("unique dl"))
+      ) {
+        indexes.modCount = index;
+        continue;
+      }
+
+      if (
+        indexes.modValue < 0 &&
+        ((label.includes("mod") && label.includes("reward")) ||
+          (label.includes("mod") && label.includes("dp")))
+      ) {
+        indexes.modValue = index;
+        continue;
+      }
+
+      if (
+        indexes.value < 0 &&
+        ((label.includes("your") && label.includes("reward")) ||
+          (label.includes("your") && label.includes("dp")))
+      ) {
+        indexes.value = index;
+        continue;
+      }
+
+      if (indexes.ratio < 0 && label.includes("ratio")) {
+        indexes.ratio = index;
+      }
+    }
+
+    return indexes;
   }
 
   function getCellText(rowElement, columnIndex) {
@@ -229,12 +325,12 @@
         return "100px";
       }
 
-      return "minmax(85px, 0.9fr)";
+      return "125px";
     };
 
     const tracks = [
       ...beforeValueColumns.map(trackForColumn),
-      "minmax(85px, 0.9fr)",
+      "125px",
       ...(valueColumn ? [trackForColumn(valueColumn)] : []),
       ...afterValueColumns.map(trackForColumn),
     ];
@@ -291,19 +387,55 @@
         overflow-x: auto;
       }
 
-      ul.store-items .report_entry[data-tm-has-extra="1"],
-      ul.store-items .report_entry_head[data-tm-has-extra="1"] {
+      ul.store-items .report_entry[data-tm-has-extra="1"][${REPORT_MODE_ATTR}="${REPORT_MODE_I20}"],
+      ul.store-items .report_entry_head[data-tm-has-extra="1"][${REPORT_MODE_ATTR}="${REPORT_MODE_I20}"] {
         display: grid !important;
         grid-template-columns:
-          minmax(240px, 2.4fr)
-          minmax(140px, 1.4fr)
+          minmax(240px, 1.4fr)
+          minmax(140px, 0.8fr)
           ${getDataColumnsTemplate()};
         column-gap: 10px;
         align-items: center;
       }
 
-      ul.store-items .report_entry[data-tm-has-extra="1"] > span,
-      ul.store-items .report_entry_head[data-tm-has-extra="1"] > .report_entry_head--title {
+      ul.store-items .report_entry[data-tm-has-extra="1"][${REPORT_MODE_ATTR}="${REPORT_MODE_I20}"] > span,
+      ul.store-items .report_entry_head[data-tm-has-extra="1"][${REPORT_MODE_ATTR}="${REPORT_MODE_I20}"] > .report_entry_head--title {
+        width: auto !important;
+        min-width: 0;
+      }
+
+      ul.store-items .report_entry[data-tm-has-extra="1"][${REPORT_MODE_ATTR}="${REPORT_MODE_UNIQUE}"],
+      ul.store-items .report_entry_head[data-tm-has-extra="1"][${REPORT_MODE_ATTR}="${REPORT_MODE_UNIQUE}"] {
+        display: grid !important;
+        column-gap: 10px;
+        align-items: center;
+      }
+
+      ul.store-items .report_entry[data-tm-has-extra="1"][${REPORT_MODE_ATTR}="${REPORT_MODE_UNIQUE}"][${UNIQUE_RATIO_ATTR}="1"],
+      ul.store-items .report_entry_head[data-tm-has-extra="1"][${REPORT_MODE_ATTR}="${REPORT_MODE_UNIQUE}"][${UNIQUE_RATIO_ATTR}="1"] {
+        grid-template-columns:
+          minmax(240px, 1.4fr)
+          minmax(140px, 0.8fr)
+          120px
+          100px
+          125px
+          100px
+          70px;
+      }
+
+      ul.store-items .report_entry[data-tm-has-extra="1"][${REPORT_MODE_ATTR}="${REPORT_MODE_UNIQUE}"][${UNIQUE_RATIO_ATTR}="0"],
+      ul.store-items .report_entry_head[data-tm-has-extra="1"][${REPORT_MODE_ATTR}="${REPORT_MODE_UNIQUE}"][${UNIQUE_RATIO_ATTR}="0"] {
+        grid-template-columns:
+          minmax(240px, 1.4fr)
+          minmax(140px, 0.8fr)
+          120px
+          100px
+          100px
+          70px;
+      }
+
+      ul.store-items .report_entry[data-tm-has-extra="1"][${REPORT_MODE_ATTR}="${REPORT_MODE_UNIQUE}"] > span,
+      ul.store-items .report_entry_head[data-tm-has-extra="1"][${REPORT_MODE_ATTR}="${REPORT_MODE_UNIQUE}"] > .report_entry_head--title {
         width: auto !important;
         min-width: 0;
       }
@@ -339,6 +471,18 @@
         text-align: center;
       }
 
+      ul.store-items .report_entry[data-tm-has-extra="1"][${REPORT_MODE_ATTR}="${REPORT_MODE_UNIQUE}"] > span[data-tm-unique-base-col="modCount"],
+      ul.store-items .report_entry[data-tm-has-extra="1"][${REPORT_MODE_ATTR}="${REPORT_MODE_UNIQUE}"] > span[data-tm-unique-base-col="modValue"],
+      ul.store-items .report_entry[data-tm-has-extra="1"][${REPORT_MODE_ATTR}="${REPORT_MODE_UNIQUE}"] > span[data-tm-unique-base-col="value"] {
+        text-align: right;
+        font-variant-numeric: tabular-nums;
+      }
+
+      ul.store-items .report_entry[data-tm-has-extra="1"][${REPORT_MODE_ATTR}="${REPORT_MODE_UNIQUE}"] > span[data-tm-extra-col="status"],
+      ul.store-items .report_entry_head[data-tm-has-extra="1"][${REPORT_MODE_ATTR}="${REPORT_MODE_UNIQUE}"] > .report_entry_head--title[data-tm-extra-col="status"] {
+        text-align: center !important;
+      }
+
       ul.store-items li[${TOTAL_ROW_ATTR}="1"] .report_entry {
         margin-top: 6px;
         padding-top: 6px;
@@ -357,6 +501,34 @@
       ul.store-items li[${TOTAL_ROW_ATTR}="1"] .report_entry > span[data-tm-total-game="1"],
       ul.store-items li[${TOTAL_ROW_ATTR}="1"] .report_entry > span[data-tm-total-ratio="1"] {
         text-align: center;
+      }
+
+      ul.store-items li[${TOTAL_ROW_ATTR}="1"] .report_entry[${REPORT_MODE_ATTR}="${REPORT_MODE_UNIQUE}"] {
+        margin-top: 0;
+        padding-top: 0;
+        border-top: 0;
+      }
+
+      ul.store-items li[${TOTAL_ROW_ATTR}="1"] .report_entry[${REPORT_MODE_ATTR}="${REPORT_MODE_UNIQUE}"] > span {
+        border-top: 1px solid rgba(255, 255, 255, 0.2);
+        padding-top: 6px;
+      }
+
+      ul.store-items li[${TOTAL_ROW_ATTR}="1"] .report_entry[${REPORT_MODE_ATTR}="${REPORT_MODE_UNIQUE}"] > span:nth-child(1) {
+        text-align: left;
+      }
+
+      ul.store-items li[${TOTAL_ROW_ATTR}="1"] .report_entry[${REPORT_MODE_ATTR}="${REPORT_MODE_UNIQUE}"] > span[data-tm-extra-col="modCount"],
+      ul.store-items li[${TOTAL_ROW_ATTR}="1"] .report_entry[${REPORT_MODE_ATTR}="${REPORT_MODE_UNIQUE}"] > span[data-tm-extra-col="modValue"],
+      ul.store-items li[${TOTAL_ROW_ATTR}="1"] .report_entry[${REPORT_MODE_ATTR}="${REPORT_MODE_UNIQUE}"] > span[data-tm-extra-col="value"] {
+        text-align: right;
+        font-variant-numeric: tabular-nums;
+      }
+
+      ul.store-items li[${TOTAL_ROW_ATTR}="1"] .report_entry[${REPORT_MODE_ATTR}="${REPORT_MODE_UNIQUE}"] > span[data-tm-total-ratio="1"],
+      ul.store-items li[${TOTAL_ROW_ATTR}="1"] .report_entry[${REPORT_MODE_ATTR}="${REPORT_MODE_UNIQUE}"] > span:nth-child(2),
+      ul.store-items li[${TOTAL_ROW_ATTR}="1"] .report_entry[${REPORT_MODE_ATTR}="${REPORT_MODE_UNIQUE}"] > span[data-tm-extra-col="status"] {
+        text-align: center !important;
       }
 
       #store-items ul.store-items li[${WALLET_SEPARATOR_ATTR}="1"] .con-vs-alert,
@@ -809,6 +981,7 @@
     }
 
     totalEntry.dataset.tmHasExtra = "1";
+    totalEntry.setAttribute(REPORT_MODE_ATTR, REPORT_MODE_I20);
     totalEntry.textContent = "";
 
     totalEntry.appendChild(createTotalCell("Total"));
@@ -861,6 +1034,66 @@
     }
   }
 
+  function upsertTotalRowForUnique(hasRows, totalsByKey, hasRatioColumn, totalRatioPercent) {
+    const list = getStoreList();
+    if (!list) {
+      return;
+    }
+
+    let totalRow = list.querySelector(`li[${TOTAL_ROW_ATTR}="1"]`);
+    if (!hasRows) {
+      if (totalRow) {
+        totalRow.remove();
+      }
+      return;
+    }
+
+    if (!totalRow) {
+      totalRow = document.createElement("li");
+      totalRow.setAttribute(TOTAL_ROW_ATTR, "1");
+      const totalEntry = document.createElement("div");
+      totalEntry.className = "report_entry";
+      totalRow.appendChild(totalEntry);
+      list.appendChild(totalRow);
+    }
+
+    const totalEntry = totalRow.querySelector(".report_entry");
+    if (!totalEntry) {
+      return;
+    }
+
+    totalEntry.dataset.tmHasExtra = "1";
+    totalEntry.setAttribute(REPORT_MODE_ATTR, REPORT_MODE_UNIQUE);
+    totalEntry.setAttribute(UNIQUE_RATIO_ATTR, hasRatioColumn ? "1" : "0");
+    totalEntry.textContent = "";
+
+    totalEntry.appendChild(createTotalCell("Total"));
+    const totalGameCell = createTotalCell("-");
+    totalGameCell.dataset.tmTotalGame = "1";
+    totalEntry.appendChild(totalGameCell);
+
+    totalEntry.appendChild(
+      createTotalCell(formatExtraColumnValue(totalsByKey.modCount, "int"), "modCount", totalsByKey.modCount),
+    );
+    totalEntry.appendChild(
+      createTotalCell(formatExtraColumnValue(totalsByKey.modValue, "int"), "modValue", totalsByKey.modValue),
+    );
+    if (hasRatioColumn) {
+      const ratioCell = createTotalCell(formatRatioPercent(totalRatioPercent), undefined, totalRatioPercent);
+      ratioCell.dataset.tmTotalRatio = "1";
+      totalEntry.appendChild(ratioCell);
+    }
+
+    totalEntry.appendChild(
+      createTotalCell(formatExtraColumnValue(totalsByKey.value, "int"), "value", totalsByKey.value),
+    );
+    totalEntry.appendChild(createTotalCell("-", "status", NaN));
+
+    if (list.lastElementChild !== totalRow) {
+      list.appendChild(totalRow);
+    }
+  }
+
   function cleanupEnhancements() {
     removeTotalRow();
     removeEnhancementNotice();
@@ -869,6 +1102,8 @@
     const header = document.querySelector("ul.store-items .report_entry_head");
     if (header) {
       header.removeAttribute("data-tm-has-extra");
+      header.removeAttribute(REPORT_MODE_ATTR);
+      header.removeAttribute(UNIQUE_RATIO_ATTR);
       const extraHeaders = header.querySelectorAll(".report_entry_head--title[data-tm-extra-col]");
       for (const node of extraHeaders) {
         node.remove();
@@ -883,6 +1118,13 @@
     const entries = document.querySelectorAll("ul.store-items .report_entry");
     for (const entry of entries) {
       entry.removeAttribute("data-tm-has-extra");
+      entry.removeAttribute(REPORT_MODE_ATTR);
+      entry.removeAttribute(UNIQUE_RATIO_ATTR);
+      const allCells = entry.querySelectorAll("span");
+      for (const cell of allCells) {
+        delete cell.dataset.tmRawValue;
+        delete cell.dataset.tmUniqueBaseCol;
+      }
       const extraCells = entry.querySelectorAll("span[data-tm-extra-col]");
       for (const node of extraCells) {
         node.remove();
@@ -938,6 +1180,7 @@
     }
 
     header.dataset.tmHasExtra = "1";
+    header.setAttribute(REPORT_MODE_ATTR, REPORT_MODE_I20);
 
     for (const column of EXTRA_COLUMNS) {
       let headerCell = header.querySelector(
@@ -977,6 +1220,7 @@
       }
 
       rowEntry.dataset.tmHasExtra = "1";
+      rowEntry.setAttribute(REPORT_MODE_ATTR, REPORT_MODE_I20);
 
       const modName = String(cells[0].textContent ?? "").replace(/\s+/g, " ").trim();
       const gameName = String(cells[1].textContent ?? "").replace(/\s+/g, " ").trim();
@@ -1045,6 +1289,174 @@
     upsertTotalRow(true, totalsByKey);
   }
 
+  function applyUniqueDownloadsEnhancements() {
+    const header = document.querySelector("ul.store-items .report_entry_head");
+    if (!header) {
+      return;
+    }
+
+    header.dataset.tmHasExtra = "1";
+    header.setAttribute(REPORT_MODE_ATTR, REPORT_MODE_UNIQUE);
+    header.setAttribute(UNIQUE_RATIO_ATTR, "0");
+
+    const nonStatusHeaders = header.querySelectorAll(
+      '.report_entry_head--title[data-tm-extra-col]:not([data-tm-extra-col="status"])',
+    );
+    for (const node of nonStatusHeaders) {
+      node.remove();
+    }
+
+    const statusColumn = EXTRA_COLUMNS.find((column) => column.key === "status");
+    if (statusColumn) {
+      let statusHeader = header.querySelector('.report_entry_head--title[data-tm-extra-col="status"]');
+      if (!statusHeader) {
+        statusHeader = document.createElement("span");
+        statusHeader.className = "report_entry_head--title";
+        statusHeader.dataset.tmExtraCol = "status";
+        header.appendChild(statusHeader);
+      }
+      statusHeader.textContent = statusColumn.label;
+    }
+
+    const rows = getEntryRows();
+    if (!rows.length) {
+      upsertTotalRowForUnique(false, {}, false, NaN);
+      return;
+    }
+
+    const uniqueColumnIndexes = findUniqueColumnIndexes(header);
+    const hasRatioColumn = Number.isInteger(uniqueColumnIndexes.ratio) && uniqueColumnIndexes.ratio >= 0;
+    header.setAttribute(UNIQUE_RATIO_ATTR, hasRatioColumn ? "1" : "0");
+    const baseHeaderCells = getBaseHeaderCells(header);
+    if (
+      Number.isInteger(uniqueColumnIndexes.modCount) &&
+      uniqueColumnIndexes.modCount >= 0 &&
+      uniqueColumnIndexes.modCount < baseHeaderCells.length
+    ) {
+      baseHeaderCells[uniqueColumnIndexes.modCount].textContent = "Unique DLs";
+    }
+    if (
+      Number.isInteger(uniqueColumnIndexes.modValue) &&
+      uniqueColumnIndexes.modValue >= 0 &&
+      uniqueColumnIndexes.modValue < baseHeaderCells.length
+    ) {
+      baseHeaderCells[uniqueColumnIndexes.modValue].textContent = "Mod's DP";
+    }
+    if (
+      Number.isInteger(uniqueColumnIndexes.value) &&
+      uniqueColumnIndexes.value >= 0 &&
+      uniqueColumnIndexes.value < baseHeaderCells.length
+    ) {
+      baseHeaderCells[uniqueColumnIndexes.value].textContent = "Your DP";
+    }
+    const totalsByKey = {
+      modCount: 0,
+      modValue: 0,
+      value: 0,
+    };
+
+    const addToTotal = (key, entryData, fallbackText) => {
+      const valueFromEntry = entryData?.[key];
+      if (Number.isFinite(valueFromEntry)) {
+        totalsByKey[key] += valueFromEntry;
+        return valueFromEntry;
+      }
+
+      const parsed = parseNumericValue(fallbackText ?? "");
+      if (Number.isFinite(parsed)) {
+        totalsByKey[key] += parsed;
+        return parsed;
+      }
+
+      return NaN;
+    };
+
+    for (const row of rows) {
+      const cells = getEntryCells(row);
+      if (cells.length < 2) {
+        continue;
+      }
+
+      for (const cell of cells) {
+        delete cell.dataset.tmUniqueBaseCol;
+      }
+
+      const rowEntry = row.querySelector(".report_entry");
+      if (!rowEntry) {
+        continue;
+      }
+
+      const nonStatusExtraCells = rowEntry.querySelectorAll(
+        'span[data-tm-extra-col]:not([data-tm-extra-col="status"])',
+      );
+      for (const node of nonStatusExtraCells) {
+        node.remove();
+      }
+
+      rowEntry.dataset.tmHasExtra = "1";
+      rowEntry.setAttribute(REPORT_MODE_ATTR, REPORT_MODE_UNIQUE);
+      rowEntry.setAttribute(UNIQUE_RATIO_ATTR, hasRatioColumn ? "1" : "0");
+
+      const modName = String(cells[0].textContent ?? "").replace(/\s+/g, " ").trim();
+      const gameName = String(cells[1].textContent ?? "").replace(/\s+/g, " ").trim();
+      const entryData = resolveEntryData(modName, gameName);
+
+      const setRawForBaseCell = (key, index) => {
+        if (!Number.isInteger(index) || index < 0 || index >= cells.length) {
+          if (Number.isFinite(entryData?.[key])) {
+            totalsByKey[key] += entryData[key];
+          }
+          return;
+        }
+
+        const cell = cells[index];
+        cell.dataset.tmUniqueBaseCol = key;
+        const numericRaw = addToTotal(key, entryData, cell.textContent);
+        if (Number.isFinite(numericRaw)) {
+          cell.dataset.tmRawValue = String(numericRaw);
+        } else {
+          delete cell.dataset.tmRawValue;
+        }
+      };
+
+      setRawForBaseCell("modCount", uniqueColumnIndexes.modCount);
+      setRawForBaseCell("modValue", uniqueColumnIndexes.modValue);
+      setRawForBaseCell("value", uniqueColumnIndexes.value);
+
+      if (
+        hasRatioColumn &&
+        uniqueColumnIndexes.ratio >= 0 &&
+        uniqueColumnIndexes.ratio < cells.length
+      ) {
+        cells[uniqueColumnIndexes.ratio].dataset.tmUniqueBaseCol = "ratio";
+      }
+
+      let statusCell = rowEntry.querySelector('span[data-tm-extra-col="status"]');
+      if (!statusCell) {
+        statusCell = document.createElement("span");
+        statusCell.dataset.tmExtraCol = "status";
+        rowEntry.appendChild(statusCell);
+      }
+
+      const rawStatus = entryData?.status;
+      if (Number.isInteger(rawStatus)) {
+        statusCell.dataset.tmRawValue = String(rawStatus);
+      } else {
+        delete statusCell.dataset.tmRawValue;
+      }
+      statusCell.textContent = formatExtraColumnValue(rawStatus, "int");
+    }
+
+    const totalRatioPercent =
+      Number.isFinite(totalsByKey.modValue) &&
+      totalsByKey.modValue > 0 &&
+      Number.isFinite(totalsByKey.value)
+        ? (totalsByKey.value / totalsByKey.modValue) * 100
+        : NaN;
+
+    upsertTotalRowForUnique(true, totalsByKey, hasRatioColumn, totalRatioPercent);
+  }
+
   function applyModLinks() {
     const rows = getEntryRows();
     if (!rows.length) {
@@ -1092,6 +1504,14 @@
   }
 
   function rememberEntriesFromPayload(payload) {
+    const reportType = String(payload?.message?.data?.userMonthlyReport?.reportType ?? "")
+      .trim()
+      .toUpperCase();
+    const parsedRoute = parseYearAndMonthFromHash();
+    if (reportType && parsedRoute) {
+      reportTypeByYearAndMonth.set(makeYearAndMonthKey(parsedRoute.year, parsedRoute.month), reportType);
+    }
+
     const entries = payload?.message?.data?.userMonthlyReport?.entries;
     if (!Array.isArray(entries) || !entries.length) {
       return;
@@ -1150,6 +1570,13 @@
           entryDataByNameAndGame.set(entryKey, nextEntryData);
           hasUpdates = true;
         }
+      }
+
+      const entryYear = toIntegerOrNull(entry?.year);
+      const entryMonth = toIntegerOrNull(entry?.month);
+      const reportTypeKey = makeYearAndMonthKey(entryYear, entryMonth);
+      if (reportType && reportTypeKey) {
+        reportTypeByYearAndMonth.set(reportTypeKey, reportType);
       }
     }
 
@@ -1464,7 +1891,12 @@
         }
 
         upsertEnhancementNotice();
-        applyExtraColumns();
+        const reportMode = getCurrentReportMode();
+        if (reportMode === REPORT_MODE_UNIQUE) {
+          applyUniqueDownloadsEnhancements();
+        } else {
+          applyExtraColumns();
+        }
         bindHeaderSorting();
         applyModLinks();
         sortRowsInPlace();
