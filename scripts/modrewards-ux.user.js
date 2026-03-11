@@ -2,9 +2,11 @@
 // @name         Nexus ModRewards UX Enhancer
 // @namespace    https://github.com/Akiway
 // @author       Akiway
-// @version      1.1.0
+// @version      1.1.1
 // @description  Adds sortable columns, mod links, extra fields, totals on reports, and wallet enhancements.
 // @match        https://www.nexusmods.com/modrewards*
+// @updateURL    https://github.com/Akiway/Tampermonkey-Nexus/blob/main/scripts/modrewards-ux.user.js
+// @downloadURL	 https://github.com/Akiway/Tampermonkey-Nexus/blob/main/scripts/modrewards-ux.user.js
 // @run-at       document-start
 // @grant        none
 // ==/UserScript==
@@ -277,11 +279,12 @@
 
       a.${LINK_CLASS} {
         color: inherit;
-        text-decoration: underline;
+        text-decoration: none !important;
       }
 
       a.${LINK_CLASS}:hover {
         color: #f9a93a;
+        text-decoration: none !important;
       }
 
       ul.store-items {
