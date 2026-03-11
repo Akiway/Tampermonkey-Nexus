@@ -17,6 +17,7 @@
   const CUTOFF_YEAR = 2024;
   const CUTOFF_MONTH = 5;
   const STYLE_ID = "tm-modrewards-ux-style";
+  const NOTICE_ID = "tm-modrewards-notice";
   const LINK_CLASS = "tm-mod-link";
   const TOTAL_ROW_ATTR = "data-tm-total-row";
   const EXTRA_COLUMNS = [
@@ -336,6 +337,95 @@
       ul.store-items li[${TOTAL_ROW_ATTR}="1"] .report_entry > span[data-tm-total-ratio="1"] {
         text-align: center;
       }
+
+      #${NOTICE_ID} {
+        position: fixed;
+        top: 74px;
+        right: 14px;
+        z-index: 2147483647;
+        padding: 8px 12px;
+        border-radius: 8px;
+        border: 1px solid rgba(249, 169, 58, 0.55);
+        background: rgba(14, 14, 14, 0.50);
+        color: #e6e6e6;
+        font-size: 12px;
+        line-height: 1.35;
+        box-shadow: 0 8px 18px rgba(0, 0, 0, 0.35);
+      }
+
+      #${NOTICE_ID} .tm-notice-line {
+        white-space: nowrap;
+      }
+
+      #${NOTICE_ID} .tm-notice-author-link {
+        text-decoration: none;
+      }
+
+      #${NOTICE_ID} .tm-notice-author-link:hover {
+        color: #f9a93a;
+      }
+
+      #${NOTICE_ID} .tm-notice-inline-icon {
+        width: 13px;
+        height: 13px;
+        display: inline-block;
+        vertical-align: -2px;
+        margin-right: 5px;
+        border-radius: 50%;
+      }
+
+      #${NOTICE_ID} .tm-notice-inline-icon img {
+        width: 100%;
+        height: 100%;
+        display: block;
+        border-radius: 50%;
+      }
+
+      #${NOTICE_ID} .tm-notice-buttons {
+        margin-top: 7px;
+        display: flex;
+        gap: 8px;
+        justify-content: flex-end;
+      }
+
+      #${NOTICE_ID} .tm-notice-btn {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 4px 9px;
+        border-radius: 5px;
+        border: 1px solid rgba(249, 169, 58, 0.75);
+        background: #1f1f1f;
+        color: #f1f1f1;
+        text-decoration: none;
+        font-size: 12px;
+        font-weight: 600;
+        letter-spacing: 0.1px;
+      }
+
+      #${NOTICE_ID} .tm-notice-btn:hover {
+        background: #2a2a2a;
+        border-color: #f9a93a;
+        color: #ffffff;
+      }
+
+      #${NOTICE_ID} .tm-notice-btn-icon {
+        width: 13px;
+        height: 13px;
+        display: inline-block;
+      }
+
+      #${NOTICE_ID} .tm-notice-btn-icon svg {
+        width: 100%;
+        height: 100%;
+        fill: currentColor;
+      }
+
+      #${NOTICE_ID} .tm-notice-btn-icon img {
+        width: 100%;
+        height: 100%;
+        display: block;
+      }
     `;
 
     if (document.head) {
@@ -541,6 +631,105 @@
     }
   }
 
+  function removeEnhancementNotice() {
+    const existing = document.getElementById(NOTICE_ID);
+    if (existing) {
+      existing.remove();
+    }
+  }
+
+  function createNoticeButton(label, href, iconType) {
+    const button = document.createElement("a");
+    button.className = "tm-notice-btn";
+    button.href = href;
+    button.target = "_blank";
+    button.rel = "noopener noreferrer";
+
+    const iconWrap = document.createElement("span");
+    iconWrap.className = "tm-notice-btn-icon";
+
+    if (iconType === "nexus") {
+      const icon = document.createElement("img");
+      icon.src = "https://www.nexusmods.com/favicon.ico";
+      icon.alt = "";
+      iconWrap.appendChild(icon);
+    } else {
+      const iconWrapSvg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+      iconWrapSvg.setAttribute("viewBox", "0 0 16 16");
+      iconWrapSvg.setAttribute("aria-hidden", "true");
+      const iconPath = document.createElementNS("http://www.w3.org/2000/svg", "path");
+      iconPath.setAttribute(
+        "d",
+        "M8 0C3.58 0 0 3.58 0 8a8 8 0 0 0 5.47 7.59c.4.07.55-.17.55-.38" +
+          " 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13" +
+          "-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66" +
+          ".07-.52.28-.87.5-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15" +
+          "-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.65 7.65 0 0 1 4 0c1.53-1.04" +
+          " 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87" +
+          " 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46" +
+          ".55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z",
+      );
+      iconWrapSvg.appendChild(iconPath);
+      iconWrap.appendChild(iconWrapSvg);
+    }
+
+    const text = document.createElement("span");
+    text.textContent = label;
+
+    button.appendChild(iconWrap);
+    button.appendChild(text);
+    return button;
+  }
+
+  function upsertEnhancementNotice() {
+    if (document.getElementById(NOTICE_ID)) {
+      return;
+    }
+
+    const notice = document.createElement("div");
+    notice.id = NOTICE_ID;
+
+    const line = document.createElement("div");
+    line.className = "tm-notice-line";
+    line.appendChild(document.createTextNode("This page is enhanced by "));
+
+    const authorLink = document.createElement("a");
+    authorLink.className = "tm-notice-author-link";
+    authorLink.href = "https://www.nexusmods.com/profile/Akiway";
+    authorLink.target = "_blank";
+    authorLink.rel = "noopener noreferrer";
+
+    const authorIconWrap = document.createElement("span");
+    authorIconWrap.className = "tm-notice-inline-icon";
+    const authorIcon = document.createElement("img");
+    authorIcon.src = "https://avatars.nexusmods.com/6318603/100";
+    authorIcon.alt = "";
+    authorIconWrap.appendChild(authorIcon);
+    authorLink.appendChild(authorIconWrap);
+    const author = document.createElement("strong");
+    author.textContent = "Akiway";
+    authorLink.appendChild(author);
+    line.appendChild(authorLink);
+
+    const buttons = document.createElement("div");
+    buttons.className = "tm-notice-buttons";
+    buttons.appendChild(
+      createNoticeButton("Nexus Mods", "https://www.nexusmods.com/profile/Akiway", "nexus"),
+    );
+    buttons.appendChild(
+      createNoticeButton("GitHub", "https://github.com/Akiway/Tampermonkey-Nexus", "github"),
+    );
+
+    notice.appendChild(line);
+    notice.appendChild(buttons);
+
+    if (document.body) {
+      document.body.appendChild(notice);
+    } else {
+      document.documentElement.appendChild(notice);
+    }
+  }
+
   function createTotalCell(text, extraKey, rawValue) {
     const cell = document.createElement("span");
     if (extraKey) {
@@ -638,6 +827,7 @@
 
   function cleanupEnhancements() {
     removeTotalRow();
+    removeEnhancementNotice();
 
     const header = document.querySelector("ul.store-items .report_entry_head");
     if (header) {
@@ -1025,6 +1215,7 @@
 
   function enhancePage() {
     if (!isReportsRoute()) {
+      removeEnhancementNotice();
       return;
     }
 
@@ -1037,6 +1228,7 @@
     }
 
     ensureStyle();
+    upsertEnhancementNotice();
     applyExtraColumns();
     bindHeaderSorting();
     applyModLinks();
