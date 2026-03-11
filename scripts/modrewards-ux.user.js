@@ -2,9 +2,10 @@
 // @name         Nexus ModRewards UX Enhancer
 // @namespace    https://github.com/Akiway
 // @author       Akiway
-// @version      1.2.0
+// @version      1.3.0
 // @description  Adds sortable columns, mod links, extra fields, totals on reports, and wallet enhancements.
 // @match        https://www.nexusmods.com/modrewards*
+// @match        https://www.nexusmods.com/*/modrewards*
 // @updateURL    https://github.com/Akiway/Tampermonkey-Nexus/raw/refs/heads/main/scripts/modrewards-ux.user.js
 // @downloadURL	 https://github.com/Akiway/Tampermonkey-Nexus/raw/refs/heads/main/scripts/modrewards-ux.user.js
 // @run-at       document-start
@@ -14,9 +15,10 @@
 (() => {
   "use strict";
 
-  const GAME_SLUG = "cyberpunk2077";
+  const DEFAULT_GAME_SLUG = "cyberpunk2077";
   const MOD_ENTRIES_URL_FRAGMENT = "/Core/Libs/Common/Managers/ModRewards?GetEntries";
   const MOD_SUMMARY_URL_FRAGMENT = "/Core/Libs/Common/Managers/ModRewards?GetSummary";
+  const MOD_USER_MODS_URL_FRAGMENT = "/Core/Libs/Common/Managers/ModRewards?GetUserMods";
   const STYLE_ID = "tm-modrewards-ux-style";
   const NOTICE_ID = "tm-modrewards-notice";
   const LINK_CLASS = "tm-mod-link";
@@ -42,14 +44,22 @@
   const entryDataByNameAndGame = new Map();
   const reportTypeByYearAndMonth = new Map();
   const summaryDataByYearAndMonth = new Map();
+  const userModDataById = new Map();
   const sortState = { index: -1, direction: "asc" };
+  const modsSortState = { key: "", direction: "asc" };
 
   let isSorting = false;
   let isApplyingEnhancements = false;
   let enhancementScheduled = false;
   let lastFallbackFetchKey = "";
+  let lastUserModsFetchKey = "";
   let hasSummaryFallbackFetchSucceeded = false;
   let isSummaryFallbackFetchInFlight = false;
+  let isUserModsFallbackFetchInFlight = false;
+  let isUserModsAllFetchInFlight = false;
+  let lastUserModsAllFetchKey = "";
+  let modsTotalPagesHint = 1;
+  const modsPaginationState = { pageSize: 20, currentPage: 1 };
   let reportObserver = null;
   let observerRoot = null;
   let observerPauseDepth = 0;
@@ -77,6 +87,15 @@
 
   function isWalletRoute() {
     return window.location.hash.includes("/wallet");
+  }
+
+  function isModsRoute() {
+    return /^#\/mods(?:\/|$)/.test(window.location.hash);
+  }
+
+  function getCurrentGameSlug() {
+    const match = window.location.pathname.match(/^\/([^/]+)\/modrewards(?:\/|$)/i);
+    return match?.[1] || DEFAULT_GAME_SLUG;
   }
 
   function normalizeText(value) {
@@ -118,6 +137,40 @@
 
   function getStoreList() {
     return document.querySelector("ul.store-items");
+  }
+
+  function getModsList() {
+    return document.querySelector("ul.mod-items");
+  }
+
+  function getModsHeaderRow(list = getModsList()) {
+    if (!list) {
+      return null;
+    }
+
+    return (
+      Array.from(list.children).find(
+        (child) =>
+          child.tagName === "LI" &&
+          child.querySelector(".mod-col-12-head") &&
+          child.querySelector(".mod-name-col") &&
+          !child.querySelector(".mod-item-label"),
+      ) ?? null
+    );
+  }
+
+  function getModsRows(list = getModsList()) {
+    if (!list) {
+      return [];
+    }
+
+    return Array.from(list.children).filter(
+      (child) =>
+        child.tagName === "LI" &&
+        !child.querySelector(".mod-col-12-head") &&
+        child.querySelector(".mod-name-col") &&
+        child.querySelector(".mod-percentage-col"),
+    );
   }
 
   function getEntryRows() {
@@ -301,8 +354,309 @@
         !normalized ||
         normalized === "-" ||
         Number.isFinite(parseNumericValue(normalized))
-      );
+        );
     });
+  }
+
+  function parseModIdFromHref(href) {
+    const match = String(href ?? "").match(/\/mods\/(\d+)(?:[/?#]|$)/);
+    if (!match) {
+      return null;
+    }
+
+    const parsed = Number.parseInt(match[1], 10);
+    return Number.isInteger(parsed) ? parsed : null;
+  }
+
+  function splitModNameAndGameFromLabel(labelText) {
+    const text = String(labelText ?? "").replace(/\s+/g, " ").trim();
+    const match = text.match(/^(.*)\s+for\s+(.+)$/i);
+    if (!match) {
+      return { modName: text, gameName: "" };
+    }
+
+    return {
+      modName: String(match[1] ?? "").trim(),
+      gameName: String(match[2] ?? "").trim(),
+    };
+  }
+
+  function buildAbsoluteModUrl(modUrl, modId, domainName) {
+    const normalized = String(modUrl ?? "").trim();
+    if (/^https?:\/\//i.test(normalized)) {
+      return normalized;
+    }
+
+    if (normalized.startsWith("/")) {
+      return `${window.location.origin}${normalized}`;
+    }
+
+    if (Number.isInteger(modId)) {
+      const slug = String(domainName || getCurrentGameSlug() || DEFAULT_GAME_SLUG).trim();
+      return `https://www.nexusmods.com/${slug}/mods/${modId}`;
+    }
+
+    return "";
+  }
+
+  function getModsTotalPagesFromDom() {
+    const pagers = document.querySelectorAll("ul.mod-items .wallet-labels");
+    let maxPage = 0;
+    for (const pager of pagers) {
+      const text = String(pager.textContent ?? "").replace(/\s+/g, " ").trim();
+      const match = text.match(/(\d+)\s+of\s+(\d+)/i);
+      if (!match) {
+        continue;
+      }
+
+      const totalPages = Number.parseInt(match[2], 10);
+      if (Number.isInteger(totalPages) && totalPages > maxPage) {
+        maxPage = totalPages;
+      }
+    }
+
+    return maxPage;
+  }
+
+  function removeModsPaginationControls(list) {
+    const pagerNodes = Array.from(list.children).filter(
+      (child) => child.tagName === "DIV" && child.querySelector(".wallet-labels"),
+    );
+    for (const pager of pagerNodes) {
+      pager.remove();
+    }
+  }
+
+  function getModsSortValueFromRow(row, key) {
+    if (!row) {
+      return "";
+    }
+
+    if (key === "status") {
+      return row.querySelector(".tm-mod-status-col .mod-item-select") ? "1" : "0";
+    }
+
+    if (key === "name") {
+      const linkText = row.querySelector(`.mod-name-col .mod-description a.${LINK_CLASS}`)?.textContent;
+      if (linkText) {
+        return String(linkText).replace(/\s+/g, " ").trim();
+      }
+
+      const fallbackText = row.querySelector(".mod-name-col .mod-description")?.textContent;
+      return String(fallbackText ?? "").replace(/\s+/g, " ").trim();
+    }
+
+    if (key === "game") {
+      return String(row.querySelector(".tm-mod-game-col")?.textContent ?? "")
+        .replace(/\s+/g, " ")
+        .trim();
+    }
+
+    if (key === "percentage") {
+      const ratioText = row.querySelector(".mod-percentage-col .author-ratio")?.textContent;
+      return String(ratioText ?? "").trim();
+    }
+
+    if (key === "unique") {
+      const downloadsText = row.querySelector('.mod-col-8[data-tm-mod-col="downloads"]')?.textContent;
+      return String(downloadsText ?? "").trim();
+    }
+
+    if (key === "actions") {
+      const actionsText = row.querySelector('.mod-col-8[data-tm-mod-col="actions"]')?.textContent;
+      return String(actionsText ?? "").replace(/\s+/g, " ").trim();
+    }
+
+    return "";
+  }
+
+  function getModsSearchActionsWrap() {
+    const searchInput = document.querySelector('.mods-bulk-actions input.styled-input[placeholder*="mod"]');
+    return searchInput?.closest(".mods-bulk-actions") ?? null;
+  }
+
+  function removeModsSortFieldSelector() {
+    const actionRows = Array.from(document.querySelectorAll(".mods-bulk-actions"));
+    for (const row of actionRows) {
+      const hasSearchInput = Boolean(row.querySelector("input.styled-input"));
+      if (hasSearchInput) {
+        continue;
+      }
+
+      const sortSelect = row.querySelector(
+        'select.styled-select:not([data-tm-mods-page-size])',
+      );
+      if (sortSelect) {
+        row.remove();
+        return;
+      }
+    }
+  }
+
+  function getModsTotalPagesForPageSize(rowCount) {
+    const safeRowCount = Number.isInteger(rowCount) ? rowCount : getModsRows().length;
+    const safeSize = Number.isInteger(modsPaginationState.pageSize) ? modsPaginationState.pageSize : 20;
+    return Math.max(1, Math.ceil(safeRowCount / Math.max(1, safeSize)));
+  }
+
+  function setModsHashPage(page) {
+    const nextPage = Number.isInteger(page) && page > 0 ? page : 1;
+    const currentHash = window.location.hash || "";
+    const nextHash = /^#\/mods\/\d+(?:\/\d+)?$/i.test(currentHash)
+      ? currentHash.replace(/^#\/mods\/\d+/i, `#/mods/${nextPage}`)
+      : `#/mods/${nextPage}`;
+
+    if (nextHash === currentHash) {
+      return;
+    }
+
+    const nextUrl = `${window.location.pathname}${window.location.search}${nextHash}`;
+    window.history.replaceState(null, "", nextUrl);
+  }
+
+  function normalizeModsCurrentPage(totalPages) {
+    const parsed = parseModsPageFromHash();
+    const requestedPage = Number.isInteger(parsed?.page) ? parsed.page : modsPaginationState.currentPage;
+    const clamped = Math.min(Math.max(1, requestedPage || 1), Math.max(1, totalPages));
+    modsPaginationState.currentPage = clamped;
+    return clamped;
+  }
+
+  function applyModsPagination(list = getModsList()) {
+    if (!list) {
+      return;
+    }
+
+    const rows = getModsRows(list);
+    const totalPages = getModsTotalPagesForPageSize(rows.length);
+    const currentPage = normalizeModsCurrentPage(totalPages);
+    const startIndex = (currentPage - 1) * modsPaginationState.pageSize;
+    const endIndex = startIndex + modsPaginationState.pageSize;
+
+    for (const [index, row] of rows.entries()) {
+      row.style.display = index >= startIndex && index < endIndex ? "" : "none";
+    }
+
+    const pagerInfo = document.querySelector("[data-tm-mods-page-info='1']");
+    if (pagerInfo) {
+      pagerInfo.textContent = `${currentPage} of ${totalPages}`;
+    }
+
+    const prevButton = document.querySelector("[data-tm-mods-page-prev='1']");
+    if (prevButton) {
+      prevButton.disabled = currentPage <= 1;
+    }
+    const nextButton = document.querySelector("[data-tm-mods-page-next='1']");
+    if (nextButton) {
+      nextButton.disabled = currentPage >= totalPages;
+    }
+  }
+
+  function moveToModsPage(page) {
+    const rows = getModsRows();
+    const totalPages = getModsTotalPagesForPageSize(rows.length);
+    const clamped = Math.min(Math.max(1, page), totalPages);
+    modsPaginationState.currentPage = clamped;
+    setModsHashPage(clamped);
+    applyModsPagination();
+  }
+
+  function onModsPageSizeChange(event) {
+    const nextSize = Number.parseInt(String(event?.currentTarget?.value ?? ""), 10);
+    if (![20, 50, 100].includes(nextSize)) {
+      return;
+    }
+
+    modsPaginationState.pageSize = nextSize;
+    moveToModsPage(1);
+  }
+
+  function onModsPrevPageClick() {
+    moveToModsPage(modsPaginationState.currentPage - 1);
+  }
+
+  function onModsNextPageClick() {
+    moveToModsPage(modsPaginationState.currentPage + 1);
+  }
+
+  function upsertModsPageSizeControl() {
+    const wrap = getModsSearchActionsWrap();
+    if (!wrap) {
+      return;
+    }
+
+    let control = wrap.querySelector("[data-tm-mods-page-size-wrap='1']");
+    if (!control) {
+      control = document.createElement("div");
+      control.dataset.tmModsPageSizeWrap = "1";
+      control.className = "tm-mods-page-size-wrap";
+
+      const label = document.createElement("label");
+      label.className = "tm-mods-page-size-label";
+      label.textContent = "Show";
+
+      const select = document.createElement("select");
+      select.className = "styled-select tm-mods-page-size-select";
+      select.dataset.tmModsPageSize = "1";
+      for (const size of [20, 50, 100]) {
+        const option = document.createElement("option");
+        option.value = String(size);
+        option.textContent = String(size);
+        select.appendChild(option);
+      }
+
+      const suffix = document.createElement("span");
+      suffix.className = "tm-mods-page-size-suffix";
+      suffix.textContent = "per page";
+
+      control.appendChild(label);
+      control.appendChild(select);
+      control.appendChild(suffix);
+      const clearBlock = wrap.querySelector(".clear");
+      if (clearBlock) {
+        wrap.insertBefore(control, clearBlock);
+      } else {
+        wrap.appendChild(control);
+      }
+    }
+
+    const select = control.querySelector("[data-tm-mods-page-size='1']");
+    if (select) {
+      select.value = String(modsPaginationState.pageSize);
+      if (select.dataset.tmBound !== "1") {
+        select.dataset.tmBound = "1";
+        select.addEventListener("change", onModsPageSizeChange, true);
+      }
+    }
+  }
+
+  function upsertModsPager(list = getModsList()) {
+    if (!list) {
+      return;
+    }
+
+    let pager = list.querySelector("li[data-tm-mods-pager='1']");
+    if (!pager) {
+      pager = document.createElement("li");
+      pager.dataset.tmModsPager = "1";
+      pager.className = "tm-mods-pager";
+      pager.innerHTML =
+        '<button type="button" data-tm-mods-page-prev="1">Prev</button>' +
+        '<span data-tm-mods-page-info="1">1 of 1</span>' +
+        '<button type="button" data-tm-mods-page-next="1">Next</button>';
+      list.appendChild(pager);
+    }
+
+    const prevButton = pager.querySelector("[data-tm-mods-page-prev='1']");
+    if (prevButton && prevButton.dataset.tmBound !== "1") {
+      prevButton.dataset.tmBound = "1";
+      prevButton.addEventListener("click", onModsPrevPageClick, true);
+    }
+    const nextButton = pager.querySelector("[data-tm-mods-page-next='1']");
+    if (nextButton && nextButton.dataset.tmBound !== "1") {
+      nextButton.dataset.tmBound = "1";
+      nextButton.addEventListener("click", onModsNextPageClick, true);
+    }
   }
 
   function getDataColumnsTemplate() {
@@ -544,6 +898,191 @@
       #store-items ul.store-items li[${WALLET_SEPARATOR_ATTR}="1"] .vs-alert .vs-icon {
         font-size: 14px !important;
         line-height: 18.2px !important;
+      }
+
+      ul.mod-items[data-tm-mods-enhanced="1"] > li[data-tm-mods-header="1"] > div,
+      ul.mod-items[data-tm-mods-enhanced="1"] > li[data-tm-mods-row="1"] > div > div:not(.clear) {
+        box-sizing: border-box;
+      }
+
+      ul.mod-items[data-tm-mods-enhanced="1"] > li[data-tm-mods-header="1"] > div[data-tm-mods-sortable="1"] {
+        cursor: pointer;
+        user-select: none;
+        position: relative;
+        padding-right: 18px !important;
+      }
+
+      ul.mod-items[data-tm-mods-enhanced="1"] > li[data-tm-mods-header="1"] > div[data-tm-mods-sort-dir="asc"]::after {
+        content: "\\25B2";
+        position: absolute;
+        right: 5px;
+        top: 50%;
+        transform: translateY(-50%);
+        font-size: 10px;
+        opacity: 0.8;
+      }
+
+      ul.mod-items[data-tm-mods-enhanced="1"] > li[data-tm-mods-header="1"] > div[data-tm-mods-sort-dir="desc"]::after {
+        content: "\\25BC";
+        position: absolute;
+        right: 5px;
+        top: 50%;
+        transform: translateY(-50%);
+        font-size: 10px;
+        opacity: 0.8;
+      }
+
+      ul.mod-items[data-tm-mods-enhanced="1"] > li[data-tm-mods-header="1"] > div.tm-mod-game-head,
+      ul.mod-items[data-tm-mods-enhanced="1"] > li[data-tm-mods-row="1"] > div > div.tm-mod-status-col,
+      ul.mod-items[data-tm-mods-enhanced="1"] > li[data-tm-mods-row="1"] > div > div.tm-mod-game-col {
+        display: inline-block;
+        float: left;
+        overflow: hidden;
+        padding: 10px;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      ul.mod-items[data-tm-mods-enhanced="1"] > li[data-tm-mods-header="1"] > div.tm-mod-game-head {
+        background-color: #222222;
+      }
+
+      ul.mod-items[data-tm-mods-enhanced="1"] > li[data-tm-mods-header="1"] > div.mod-col-12-head,
+      ul.mod-items[data-tm-mods-enhanced="1"] > li[data-tm-mods-row="1"] > div > div.tm-mod-status-col {
+        width: 9% !important;
+        text-align: center;
+      }
+
+      ul.mod-items[data-tm-mods-enhanced="1"] > li[data-tm-mods-header="1"] > div.mod-name-col,
+      ul.mod-items[data-tm-mods-enhanced="1"] > li[data-tm-mods-row="1"] > div > div.mod-name-col {
+        width: 27.5% !important;
+      }
+
+      ul.mod-items[data-tm-mods-enhanced="1"] > li[data-tm-mods-header="1"] > div.tm-mod-game-head,
+      ul.mod-items[data-tm-mods-enhanced="1"] > li[data-tm-mods-row="1"] > div > div.tm-mod-game-col {
+        width: 16% !important;
+      }
+
+      ul.mod-items[data-tm-mods-enhanced="1"] > li[data-tm-mods-header="1"] > div.mod-percentage-col,
+      ul.mod-items[data-tm-mods-enhanced="1"] > li[data-tm-mods-row="1"] > div > div.mod-percentage-col {
+        width: 24% !important;
+      }
+
+      ul.mod-items[data-tm-mods-enhanced="1"] > li[data-tm-mods-header="1"] > div.mod-col-8-head[data-tm-mod-col="downloads"],
+      ul.mod-items[data-tm-mods-enhanced="1"] > li[data-tm-mods-row="1"] > div > div.mod-col-8[data-tm-mod-col="downloads"] {
+        width: 11% !important;
+      }
+
+      ul.mod-items[data-tm-mods-enhanced="1"] > li[data-tm-mods-header="1"] > div.mod-col-8-head[data-tm-mod-col="actions"],
+      ul.mod-items[data-tm-mods-enhanced="1"] > li[data-tm-mods-row="1"] > div > div.mod-col-8[data-tm-mod-col="actions"] {
+        width: 12.5% !important;
+      }
+
+      ul.mod-items[data-tm-mods-enhanced="1"] > li[data-tm-mods-row="1"] > div > div.tm-mod-status-col .mod-item-select {
+        width: 24px;
+        display: block;
+        margin: 0 auto !important;
+      }
+
+      ul.mod-items[data-tm-mods-enhanced="1"] > li[data-tm-mods-header="1"] > div {
+        text-align: center !important;
+      }
+
+      ul.mod-items[data-tm-mods-enhanced="1"] > li[data-tm-mods-row="1"] > div > div.mod-col-8[data-tm-mod-col="downloads"] {
+        text-align: right !important;
+      }
+
+      ul.mod-items[data-tm-mods-enhanced="1"] > li[data-tm-mods-row="1"] > div > div.tm-mod-game-col {
+        text-align: center !important;
+      }
+
+      ul.mod-items[data-tm-mods-enhanced="1"] > li[data-tm-mods-header="1"] > div.tm-mod-game-head,
+      ul.mod-items[data-tm-mods-enhanced="1"] > li[data-tm-mods-row="1"] > div > div.tm-mod-game-col,
+      ul.mod-items[data-tm-mods-enhanced="1"] > li[data-tm-mods-row="1"] > div > div.tm-mod-game-col * {
+        color: #9a9a9a !important;
+      }
+
+      ul.mod-items[data-tm-mods-enhanced="1"] > li[data-tm-mods-row="1"] > div > div.mod-name-col .mod-description {
+        flex: 1 1 auto;
+      }
+
+      ul.mod-items[data-tm-mods-enhanced="1"] > li[data-tm-mods-row="1"] > div > div.mod-name-col .mod-item-label {
+        display: none !important;
+      }
+
+      ul.mod-items[data-tm-mods-enhanced="1"] > li[data-tm-mods-row="1"] > div > div.mod-name-col .mod-description > a[href*="/mods/"]:not(.${LINK_CLASS}) {
+        display: none !important;
+      }
+
+      ul.mod-items[data-tm-mods-enhanced="1"] > li[data-tm-mods-row="1"] > div > div.mod-col-8[data-tm-mod-col="actions"] {
+        text-align: right !important;
+      }
+
+      ul.mod-items[data-tm-mods-enhanced="1"] .mod-item-author-badge.small,
+      ul.mod-items[data-tm-mods-enhanced="1"] .mod-item-author-badge.small span,
+      ul.mod-items[data-tm-mods-enhanced="1"] .mod-item-author-badge.small img {
+        width: 40px !important;
+      }
+
+      ul.mod-items[data-tm-mods-enhanced="1"] .mod-item-author-badge.small .author-avatar {
+        width: 40px !important;
+        height: 40px !important;
+      }
+
+      ul.mod-items[data-tm-mods-enhanced="1"] .mod-item-author-badge.small .author-info {
+        width: 40px !important;
+      }
+
+      ul.mod-items[data-tm-mods-enhanced="1"] .mod-item-author-badge {
+        margin-bottom: 0 !important;
+      }
+
+      ul.mod-items[data-tm-mods-enhanced="1"] .clear {
+        height: 0;
+      }
+
+      .tm-mods-page-size-wrap {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        margin-left: 12px;
+        float: left;
+      }
+
+      .tm-mods-page-size-wrap .tm-mods-page-size-label,
+      .tm-mods-page-size-wrap .tm-mods-page-size-suffix {
+        color: #e1e1e1;
+        font-size: 13px;
+      }
+
+      .tm-mods-page-size-wrap .tm-mods-page-size-select {
+        width: 84px;
+        margin-left: 0 !important;
+        padding-right: 24px;
+        background-image: url(/assets/images/wallet/select-down-arrow.png);
+      }
+
+      ul.mod-items li.tm-mods-pager[data-tm-mods-pager="1"] {
+        list-style: none;
+        display: flex;
+        justify-content: flex-end;
+        align-items: center;
+        gap: 10px;
+        margin-top: 8px;
+        color: #e1e1e1;
+      }
+
+      ul.mod-items li.tm-mods-pager[data-tm-mods-pager="1"] button {
+        border: 1px solid #3f3f3f;
+        background: #202020;
+        color: #e1e1e1;
+        padding: 4px 10px;
+        cursor: pointer;
+      }
+
+      ul.mod-items li.tm-mods-pager[data-tm-mods-pager="1"] button:disabled {
+        opacity: 0.45;
+        cursor: default;
       }
 
       #${NOTICE_ID} {
@@ -1131,7 +1670,7 @@
       }
     }
 
-    const links = document.querySelectorAll(`a.${LINK_CLASS}`);
+    const links = document.querySelectorAll(`ul.store-items a.${LINK_CLASS}`);
     for (const link of links) {
       const text = document.createTextNode(link.textContent ?? "");
       link.replaceWith(text);
@@ -1139,6 +1678,36 @@
 
     sortState.index = -1;
     sortState.direction = "asc";
+  }
+
+  function cleanupModsEnhancements() {
+    const list = getModsList();
+    if (list) {
+      delete list.dataset.tmModsEnhanced;
+      delete list.dataset.tmModsExpandedCount;
+      const pager = list.querySelector("li[data-tm-mods-pager='1']");
+      if (pager) {
+        pager.remove();
+      }
+      const header = getModsHeaderRow(list);
+      if (header) {
+        delete header.dataset.tmModsHeader;
+        const sortableHeaders = header.querySelectorAll("div[data-tm-mods-sort-dir]");
+        for (const cell of sortableHeaders) {
+          cell.removeAttribute("data-tm-mods-sort-dir");
+        }
+      }
+    }
+
+    const pageSizeWrap = document.querySelector("[data-tm-mods-page-size-wrap='1']");
+    if (pageSizeWrap) {
+      pageSizeWrap.remove();
+    }
+
+    modsSortState.key = "";
+    modsSortState.direction = "asc";
+    modsPaginationState.pageSize = 20;
+    modsPaginationState.currentPage = 1;
   }
 
   function removeWalletReportSeparators() {
@@ -1482,7 +2051,7 @@
         continue;
       }
 
-      const url = `https://www.nexusmods.com/${GAME_SLUG}/mods/${modId}`;
+      const url = `https://www.nexusmods.com/${getCurrentGameSlug()}/mods/${modId}`;
       const existingLink = modCell.querySelector(`a.${LINK_CLASS}`);
       if (existingLink) {
         existingLink.href = url;
@@ -1501,6 +2070,508 @@
       modCell.textContent = "";
       modCell.appendChild(link);
     }
+  }
+
+  function parseModsPageFromHash() {
+    const match = window.location.hash.match(/^#\/mods\/(\d+)(?:\/\d+)?$/);
+    if (!match) {
+      return null;
+    }
+
+    const page = Number.parseInt(match[1], 10);
+    if (!Number.isInteger(page) || page < 1) {
+      return null;
+    }
+
+    return { page };
+  }
+
+  function rememberUserModsFromPayload(payload) {
+    const mods = payload?.message?.mods;
+    if (!Array.isArray(mods) || !mods.length) {
+      return;
+    }
+
+    let hasUpdates = false;
+
+    for (const mod of mods) {
+      const modId = toIntegerOrNull(mod?.mod_id ?? mod?.modId);
+      if (!Number.isInteger(modId)) {
+        continue;
+      }
+
+      const modName = String(mod?.name ?? "").trim();
+      const gameName = String(mod?.game_name ?? mod?.gameName ?? "").trim();
+      const domainName = String(mod?.domain_name ?? mod?.domainName ?? "").trim();
+      const modUrl = String(mod?.mod_url ?? mod?.modUrl ?? "").trim();
+      const downloads = toIntegerOrNull(mod?.downloads);
+      const optedIn = Boolean(mod?.opted_in ?? mod?.optedIn);
+      const authorRatio = Number(mod?.authors?.[0]?.ratio);
+      const authorAvatar = String(mod?.authors?.[0]?.avatar ?? "").trim();
+      const ratioPercent = Number.isFinite(authorRatio) ? authorRatio * 100 : NaN;
+
+      const nextModData = {
+        modId,
+        modName,
+        gameName,
+        domainName,
+        modUrl,
+        downloads,
+        optedIn,
+        authorAvatar,
+        ratioPercent,
+      };
+
+      const currentModData = userModDataById.get(modId);
+      const hasChanged =
+        !currentModData ||
+        currentModData.modName !== nextModData.modName ||
+        currentModData.gameName !== nextModData.gameName ||
+        currentModData.domainName !== nextModData.domainName ||
+        currentModData.modUrl !== nextModData.modUrl ||
+        currentModData.downloads !== nextModData.downloads ||
+        currentModData.optedIn !== nextModData.optedIn ||
+        currentModData.authorAvatar !== nextModData.authorAvatar ||
+        currentModData.ratioPercent !== nextModData.ratioPercent;
+
+      if (hasChanged) {
+        userModDataById.set(modId, nextModData);
+        hasUpdates = true;
+      }
+    }
+
+    if (hasUpdates && isModsRoute()) {
+      scheduleEnhancement();
+    }
+  }
+
+  function updateModsSortIndicators(headerRow) {
+    const sortableCells = headerRow?.querySelectorAll("div[data-tm-mods-sort-key]");
+    if (!sortableCells) {
+      return;
+    }
+
+    for (const cell of sortableCells) {
+      if (cell.dataset.tmModsSortKey === modsSortState.key) {
+        cell.dataset.tmModsSortDir = modsSortState.direction;
+      } else {
+        cell.removeAttribute("data-tm-mods-sort-dir");
+      }
+    }
+  }
+
+  function sortModsRowsInPlace() {
+    if (!isModsRoute() || !modsSortState.key) {
+      applyModsPagination();
+      return;
+    }
+
+    const list = getModsList();
+    if (!list) {
+      return;
+    }
+
+    const rows = getModsRows(list);
+    if (rows.length < 2) {
+      applyModsPagination(list);
+      return;
+    }
+
+    const insertionRef = rows[rows.length - 1].nextSibling;
+    const isNumeric =
+      modsSortState.key === "status" ||
+      modsSortState.key === "percentage" ||
+      modsSortState.key === "unique";
+    const items = rows.map((row, index) => ({
+      row,
+      index,
+      raw: getModsSortValueFromRow(row, modsSortState.key),
+    }));
+
+    items.sort((left, right) => {
+      let comparison = 0;
+      if (isNumeric) {
+        const leftValue = parseNumericValue(left.raw);
+        const rightValue = parseNumericValue(right.raw);
+        const safeLeft = Number.isFinite(leftValue) ? leftValue : -Infinity;
+        const safeRight = Number.isFinite(rightValue) ? rightValue : -Infinity;
+        comparison = safeLeft - safeRight;
+      } else {
+        comparison = collator.compare(String(left.raw), String(right.raw));
+      }
+
+      if (comparison !== 0) {
+        return modsSortState.direction === "asc" ? comparison : -comparison;
+      }
+
+      return left.index - right.index;
+    });
+
+    pauseObserver();
+    isSorting = true;
+    try {
+      for (const item of items) {
+        list.insertBefore(item.row, insertionRef);
+      }
+    } finally {
+      isSorting = false;
+      resumeObserver();
+    }
+
+    applyModsPagination(list);
+  }
+
+  function onModsHeaderClick(event) {
+    if (!isModsRoute()) {
+      return;
+    }
+
+    const key = String(event.currentTarget?.dataset?.tmModsSortKey ?? "").trim();
+    if (!key) {
+      return;
+    }
+
+    if (modsSortState.key === key) {
+      modsSortState.direction = modsSortState.direction === "asc" ? "desc" : "asc";
+    } else {
+      modsSortState.key = key;
+      modsSortState.direction = "desc";
+    }
+
+    modsPaginationState.currentPage = 1;
+    setModsHashPage(1);
+
+    const headerRow = getModsHeaderRow();
+    updateModsSortIndicators(headerRow);
+    sortModsRowsInPlace();
+  }
+
+  function bindModsHeaderSorting(headerRow) {
+    const sortableCells = headerRow?.querySelectorAll("div[data-tm-mods-sort-key]");
+    if (!sortableCells) {
+      return;
+    }
+
+    for (const cell of sortableCells) {
+      cell.dataset.tmModsSortable = "1";
+      if (cell.dataset.tmModsSortBound !== "1") {
+        cell.dataset.tmModsSortBound = "1";
+        cell.addEventListener("click", onModsHeaderClick, true);
+      }
+    }
+
+    updateModsSortIndicators(headerRow);
+  }
+
+  function rebuildModsRowsFromUserData(list) {
+    const rows = getModsRows(list);
+    if (!rows.length || !userModDataById.size) {
+      return false;
+    }
+
+    const totalPagesFromDom = getModsTotalPagesFromDom();
+    if (totalPagesFromDom > 0) {
+      modsTotalPagesHint = totalPagesFromDom;
+    }
+
+    const shouldExpand = userModDataById.size > rows.length;
+    if (!shouldExpand) {
+      return false;
+    }
+
+    if (
+      list.dataset.tmModsExpandedCount === String(userModDataById.size) &&
+      rows.length === userModDataById.size
+    ) {
+      removeModsPaginationControls(list);
+      return false;
+    }
+
+    const templateRow = rows[0].cloneNode(true);
+    const rowWithStatusIcon =
+      rows.find(
+        (row) =>
+          row.querySelector(".tm-mod-status-col .mod-item-select") ||
+          row.querySelector(".mod-name-col .mod-item-select"),
+      ) || rows[0];
+    const statusTemplateHtml =
+      rowWithStatusIcon.querySelector(".tm-mod-status-col .mod-item-select")?.outerHTML ||
+      rowWithStatusIcon.querySelector(".mod-name-col .mod-item-select")?.outerHTML ||
+      "";
+    const actionsTemplateText = String(
+      templateRow.querySelector('.mod-col-8[data-tm-mod-col="actions"]')?.textContent ?? "",
+    )
+      .replace(/\s+/g, " ")
+      .trim();
+
+    const allMods = Array.from(userModDataById.values()).sort((left, right) =>
+      collator.compare(left.modName || "", right.modName || ""),
+    );
+
+    pauseObserver();
+    try {
+      for (const row of rows) {
+        row.remove();
+      }
+      removeModsPaginationControls(list);
+
+      for (const modData of allMods) {
+        const row = templateRow.cloneNode(true);
+        row.dataset.tmModsRow = "1";
+        row.dataset.tmModId = Number.isInteger(modData.modId) ? String(modData.modId) : "";
+
+        const statusCol = row.querySelector(".tm-mod-status-col");
+        if (statusCol) {
+          statusCol.textContent = "";
+          if (modData.optedIn) {
+            if (statusTemplateHtml) {
+              statusCol.innerHTML = statusTemplateHtml;
+            } else {
+              statusCol.textContent = "1";
+            }
+          } else {
+            statusCol.textContent = "-";
+          }
+        }
+
+        const modDescription = row.querySelector(".mod-name-col .mod-description");
+        if (modDescription) {
+          const modName = String(modData.modName ?? "").trim() || "-";
+          const modUrl = buildAbsoluteModUrl(modData.modUrl, modData.modId, modData.domainName);
+          modDescription.textContent = "";
+          if (modUrl) {
+            const link = document.createElement("a");
+            link.className = LINK_CLASS;
+            link.href = modUrl;
+            link.target = "_blank";
+            link.rel = "noopener noreferrer";
+            link.textContent = modName;
+            modDescription.appendChild(link);
+          } else {
+            modDescription.textContent = modName;
+          }
+        }
+
+        const gameCol = row.querySelector(".tm-mod-game-col");
+        if (gameCol) {
+          gameCol.textContent = String(modData.gameName ?? "").trim() || "-";
+        }
+
+        const ratioElement = row.querySelector(".mod-percentage-col .author-ratio");
+        if (ratioElement) {
+          ratioElement.textContent = Number.isFinite(modData.ratioPercent)
+            ? `${percentFormatter.format(modData.ratioPercent)}%`
+            : "-";
+        }
+
+        const avatarElement = row.querySelector(".mod-percentage-col .author-avatar");
+        if (avatarElement && modData.authorAvatar) {
+          avatarElement.style.backgroundImage = `url("${modData.authorAvatar}")`;
+        }
+
+        const uniqueCol = row.querySelector('.mod-col-8[data-tm-mod-col="downloads"]');
+        if (uniqueCol) {
+          if (Number.isFinite(modData.downloads)) {
+            uniqueCol.textContent = numberFormatter.format(modData.downloads);
+            uniqueCol.dataset.tmRawValue = String(modData.downloads);
+          } else {
+            uniqueCol.textContent = "-";
+            delete uniqueCol.dataset.tmRawValue;
+          }
+        }
+
+        const actionsCol = row.querySelector('.mod-col-8[data-tm-mod-col="actions"]');
+        if (actionsCol && !String(actionsCol.textContent ?? "").trim() && actionsTemplateText) {
+          actionsCol.textContent = actionsTemplateText;
+        }
+
+        row.dataset.tmModsSortStatus = modData.optedIn ? "1" : "0";
+        row.dataset.tmModsSortName = String(modData.modName ?? "").trim();
+        row.dataset.tmModsSortGame = String(modData.gameName ?? "").trim();
+        row.dataset.tmModsSortPercentage = Number.isFinite(modData.ratioPercent)
+          ? String(modData.ratioPercent)
+          : "";
+        row.dataset.tmModsSortUnique = Number.isFinite(modData.downloads) ? String(modData.downloads) : "";
+        row.dataset.tmModsSortActions = String(actionsCol?.textContent ?? "")
+          .replace(/\s+/g, " ")
+          .trim();
+
+        list.appendChild(row);
+      }
+
+      list.dataset.tmModsExpandedCount = String(allMods.length);
+      return true;
+    } finally {
+      resumeObserver();
+    }
+  }
+
+  function applyModsEnhancements() {
+    const list = getModsList();
+    if (!list) {
+      return;
+    }
+
+    removeModsSortFieldSelector();
+
+    const headerRow = getModsHeaderRow(list);
+    if (!headerRow) {
+      return;
+    }
+
+    list.dataset.tmModsEnhanced = "1";
+    headerRow.dataset.tmModsHeader = "1";
+
+    const headerStatusCell = headerRow.querySelector(".mod-col-12-head");
+    const headerNameCell = headerRow.querySelector(".mod-name-col");
+    const headerPercentageCell = headerRow.querySelector(".mod-percentage-col");
+    const headerCol8 = Array.from(headerRow.querySelectorAll(".mod-col-8-head"));
+    const headerUniqueCell =
+      headerCol8.find((cell) => !cell.classList.contains("text-right")) || headerCol8[0] || null;
+    const headerActionsCell =
+      headerCol8.find((cell) => cell.classList.contains("text-right")) || headerCol8[1] || null;
+
+    if (!headerStatusCell || !headerNameCell || !headerPercentageCell || !headerUniqueCell || !headerActionsCell) {
+      return;
+    }
+
+    headerStatusCell.textContent = "Opted In";
+    headerUniqueCell.dataset.tmModCol = "downloads";
+    headerActionsCell.dataset.tmModCol = "actions";
+
+    let headerGameCell = headerRow.querySelector(".tm-mod-game-head");
+    if (!headerGameCell) {
+      headerGameCell = document.createElement("div");
+      headerGameCell.className = "tm-mod-game-head";
+      headerRow.insertBefore(headerGameCell, headerPercentageCell);
+    }
+    headerGameCell.textContent = "Game";
+
+    const sortableConfig = [
+      { node: headerStatusCell, key: "status" },
+      { node: headerNameCell, key: "name" },
+      { node: headerGameCell, key: "game" },
+      { node: headerPercentageCell, key: "percentage" },
+      { node: headerUniqueCell, key: "unique" },
+    ];
+
+    for (const item of sortableConfig) {
+      item.node.dataset.tmModsSortKey = item.key;
+    }
+    headerActionsCell.removeEventListener("click", onModsHeaderClick, true);
+    headerActionsCell.removeAttribute("data-tm-mods-sort-key");
+    headerActionsCell.removeAttribute("data-tm-mods-sortable");
+    headerActionsCell.removeAttribute("data-tm-mods-sort-dir");
+    headerActionsCell.removeAttribute("data-tm-mods-sort-bound");
+    bindModsHeaderSorting(headerRow);
+
+    const rows = getModsRows(list);
+    for (const row of rows) {
+      row.dataset.tmModsRow = "1";
+
+      const rowContainer = Array.from(row.children).find((child) => child.tagName === "DIV");
+      if (!rowContainer) {
+        continue;
+      }
+
+      const nameCol = rowContainer.querySelector(".mod-name-col");
+      const percentageCol = rowContainer.querySelector(".mod-percentage-col");
+      const col8Cells = Array.from(rowContainer.querySelectorAll(".mod-col-8"));
+      const uniqueCol = col8Cells[0] || null;
+      const actionsCol = col8Cells[1] || null;
+      if (!nameCol || !percentageCol || !uniqueCol || !actionsCol) {
+        continue;
+      }
+
+      uniqueCol.dataset.tmModCol = "downloads";
+      actionsCol.dataset.tmModCol = "actions";
+
+      let statusCol = rowContainer.querySelector(".tm-mod-status-col");
+      if (!statusCol) {
+        statusCol = document.createElement("div");
+        statusCol.className = "tm-mod-status-col";
+        rowContainer.insertBefore(statusCol, nameCol);
+      }
+
+      const statusIcon = nameCol.querySelector(".mod-item-select");
+      if (statusIcon) {
+        statusCol.textContent = "";
+        statusCol.appendChild(statusIcon);
+      }
+
+      const modDescription = nameCol.querySelector(".mod-description");
+      const label = modDescription?.querySelector(".mod-item-label");
+      const existingModLink = modDescription?.querySelector('a[href*="/mods/"]');
+      const existingHref = existingModLink?.getAttribute("href") ?? "";
+      const parsedModId = parseModIdFromHref(existingHref);
+      const modData = Number.isInteger(parsedModId) ? userModDataById.get(parsedModId) : null;
+
+      const labelParts = splitModNameAndGameFromLabel(label?.textContent);
+      const modName =
+        modData?.modName ||
+        labelParts.modName ||
+        String(modDescription?.querySelector(`a.${LINK_CLASS}`)?.textContent ?? "").trim() ||
+        String(label?.textContent ?? "").trim();
+      const gameName =
+        modData?.gameName ||
+        labelParts.gameName ||
+        String(rowContainer.querySelector(".tm-mod-game-col")?.textContent ?? "").trim();
+      const modUrl = buildAbsoluteModUrl(modData?.modUrl || existingHref, parsedModId, modData?.domainName);
+
+      let gameCol = rowContainer.querySelector(".tm-mod-game-col");
+      if (!gameCol) {
+        gameCol = document.createElement("div");
+        gameCol.className = "tm-mod-game-col";
+        rowContainer.insertBefore(gameCol, percentageCol);
+      }
+      gameCol.textContent = gameName || "-";
+
+      if (modDescription) {
+        if (modUrl) {
+          let link = modDescription.querySelector(`a.${LINK_CLASS}`);
+          if (!link) {
+            link = document.createElement("a");
+            link.className = LINK_CLASS;
+            link.target = "_blank";
+            link.rel = "noopener noreferrer";
+          }
+
+          link.href = modUrl;
+          link.textContent = modName || "-";
+          modDescription.textContent = "";
+          modDescription.appendChild(link);
+        } else {
+          modDescription.textContent = modName || "-";
+        }
+      }
+
+      const statusSortValue = modData ? (modData.optedIn ? 1 : 0) : statusCol.querySelector(".mod-item-select") ? 1 : 0;
+      const percentageText = percentageCol.querySelector(".author-ratio")?.textContent ?? percentageCol.textContent;
+      const percentageValue = parseNumericValue(percentageText);
+      const uniqueValueFromPayload = Number(modData?.downloads);
+      const uniqueValueFromCell = parseNumericValue(uniqueCol.textContent);
+      const uniqueValue = Number.isFinite(uniqueValueFromPayload)
+        ? uniqueValueFromPayload
+        : Number.isFinite(uniqueValueFromCell)
+          ? uniqueValueFromCell
+          : NaN;
+      if (Number.isFinite(uniqueValue)) {
+        uniqueCol.textContent = numberFormatter.format(Math.trunc(uniqueValue));
+      }
+
+      row.dataset.tmModsSortStatus = String(statusSortValue);
+      row.dataset.tmModsSortName = modName || "";
+      row.dataset.tmModsSortGame = gameName || "";
+      row.dataset.tmModsSortPercentage = Number.isFinite(percentageValue) ? String(percentageValue) : "";
+      row.dataset.tmModsSortUnique = Number.isFinite(uniqueValue) ? String(uniqueValue) : "";
+      row.dataset.tmModsSortActions = String(actionsCol.textContent ?? "").replace(/\s+/g, " ").trim();
+    }
+
+    rebuildModsRowsFromUserData(list);
+    removeModsPaginationControls(list);
+    upsertModsPageSizeControl();
+    upsertModsPager(list);
+    sortModsRowsInPlace();
   }
 
   function rememberEntriesFromPayload(payload) {
@@ -1593,6 +2664,10 @@
     return typeof url === "string" && url.includes(MOD_SUMMARY_URL_FRAGMENT);
   }
 
+  function isUserModsUrl(url) {
+    return typeof url === "string" && url.includes(MOD_USER_MODS_URL_FRAGMENT);
+  }
+
   function rememberSummaryFromPayload(payload) {
     const entries = payload?.message?.entries;
     if (!Array.isArray(entries) || !entries.length) {
@@ -1660,6 +2735,8 @@
             handler = rememberEntriesFromPayload;
           } else if (isModSummaryUrl(url)) {
             handler = rememberSummaryFromPayload;
+          } else if (isUserModsUrl(url)) {
+            handler = rememberUserModsFromPayload;
           }
 
           if (handler) {
@@ -1702,6 +2779,8 @@
         handler = rememberEntriesFromPayload;
       } else if (isModSummaryUrl(this.__tmModRewardsUrl)) {
         handler = rememberSummaryFromPayload;
+      } else if (isUserModsUrl(this.__tmModRewardsUrl)) {
+        handler = rememberUserModsFromPayload;
       }
 
       if (handler) {
@@ -1808,6 +2887,95 @@
     }
   }
 
+  async function fetchUserModsForCurrentRoute() {
+    if (!isModsRoute() || isUserModsFallbackFetchInFlight) {
+      return;
+    }
+
+    const totalPagesFromDom = getModsTotalPagesFromDom();
+    if (totalPagesFromDom > 0) {
+      modsTotalPagesHint = totalPagesFromDom;
+    }
+
+    const parsed = parseModsPageFromHash();
+    if (!parsed) {
+      return;
+    }
+
+    const key = `${window.location.pathname}|${parsed.page}`;
+    if (key === lastUserModsFetchKey) {
+      return;
+    }
+
+    isUserModsFallbackFetchInFlight = true;
+    try {
+      const response = await window.fetch(
+        `${MOD_USER_MODS_URL_FRAGMENT}&page=${parsed.page}`,
+        { credentials: "include" },
+      );
+      if (!response.ok) {
+        return;
+      }
+
+      const payload = await response.json();
+      rememberUserModsFromPayload(payload);
+      lastUserModsFetchKey = key;
+    } catch (_) {
+      // Ignore network errors in fallback fetch.
+    } finally {
+      isUserModsFallbackFetchInFlight = false;
+    }
+  }
+
+  async function fetchAllUserModsForCurrentRoute() {
+    if (!isModsRoute() || isUserModsAllFetchInFlight) {
+      return;
+    }
+
+    const totalPagesFromDom = getModsTotalPagesFromDom();
+    if (totalPagesFromDom > 0) {
+      modsTotalPagesHint = totalPagesFromDom;
+    }
+
+    const totalPages = Math.max(1, modsTotalPagesHint);
+    if (totalPages <= 1) {
+      return;
+    }
+
+    const key = `${window.location.pathname}|all|${totalPages}`;
+    if (key === lastUserModsAllFetchKey) {
+      return;
+    }
+
+    isUserModsAllFetchInFlight = true;
+    let loadedPages = 0;
+    try {
+      for (let page = 1; page <= totalPages; page += 1) {
+        const response = await window.fetch(`${MOD_USER_MODS_URL_FRAGMENT}&page=${page}`, {
+          credentials: "include",
+        });
+        if (!response.ok) {
+          break;
+        }
+
+        const payload = await response.json();
+        rememberUserModsFromPayload(payload);
+        loadedPages += 1;
+      }
+
+      if (loadedPages === totalPages) {
+        lastUserModsAllFetchKey = key;
+      }
+    } catch (_) {
+      // Ignore network errors in fallback fetch.
+    } finally {
+      isUserModsAllFetchInFlight = false;
+      if (loadedPages > 0) {
+        scheduleEnhancement();
+      }
+    }
+  }
+
   function applyWalletModCountFix() {
     if (!isWalletRoute()) {
       return;
@@ -1872,8 +3040,9 @@
   }
 
   function enhancePage() {
-    if (!isReportsRoute() && !isWalletRoute()) {
+    if (!isReportsRoute() && !isWalletRoute() && !isModsRoute()) {
       cleanupEnhancements();
+      cleanupModsEnhancements();
       removeEnhancementNotice();
       return;
     }
@@ -1884,6 +3053,7 @@
       ensureStyle();
 
       if (isReportsRoute()) {
+        cleanupModsEnhancements();
         if (!isEnhancementEligible()) {
           cleanupEnhancements();
           removeEnhancementNotice();
@@ -1900,10 +3070,15 @@
         bindHeaderSorting();
         applyModLinks();
         sortRowsInPlace();
-      } else {
+      } else if (isWalletRoute()) {
+        cleanupModsEnhancements();
         cleanupEnhancements();
         upsertEnhancementNotice();
         applyWalletModCountFix();
+      } else if (isModsRoute()) {
+        upsertEnhancementNotice();
+        fetchAllUserModsForCurrentRoute();
+        applyModsEnhancements();
       }
     } finally {
       isApplyingEnhancements = false;
@@ -1951,6 +3126,8 @@
     scheduleEnhancement();
     fetchEntriesForCurrentRoute();
     fetchSummaryForCurrentRoute();
+    fetchUserModsForCurrentRoute();
+    fetchAllUserModsForCurrentRoute();
   });
 
   if (document.readyState === "loading") {
@@ -1960,6 +3137,8 @@
         scheduleEnhancement();
         fetchEntriesForCurrentRoute();
         fetchSummaryForCurrentRoute();
+        fetchUserModsForCurrentRoute();
+        fetchAllUserModsForCurrentRoute();
       },
       { once: true },
     );
@@ -1967,9 +3146,13 @@
     scheduleEnhancement();
     fetchEntriesForCurrentRoute();
     fetchSummaryForCurrentRoute();
+    fetchUserModsForCurrentRoute();
+    fetchAllUserModsForCurrentRoute();
   }
 
   window.setTimeout(fetchEntriesForCurrentRoute, 1250);
   window.setTimeout(fetchSummaryForCurrentRoute, 1250);
+  window.setTimeout(fetchUserModsForCurrentRoute, 1250);
+  window.setTimeout(fetchAllUserModsForCurrentRoute, 1250);
   startObserver();
 })();
