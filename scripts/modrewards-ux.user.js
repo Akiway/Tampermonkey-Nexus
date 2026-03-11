@@ -1,0 +1,1107 @@
+// ==UserScript==
+// @name         Nexus ModRewards UX Enhancer
+// @namespace    https://github.com/Akiway
+// @author       Akiway
+// @version      1.0.0
+// @description  Adds sortable columns, mod links, extra fields, and totals on legacy Nexus ModRewards reports.
+// @match        https://www.nexusmods.com/modrewards*
+// @run-at       document-start
+// @grant        none
+// ==/UserScript==
+
+(() => {
+  "use strict";
+
+  const GAME_SLUG = "cyberpunk2077";
+  const MOD_ENTRIES_URL_FRAGMENT = "/Core/Libs/Common/Managers/ModRewards?GetEntries";
+  const CUTOFF_YEAR = 2024;
+  const CUTOFF_MONTH = 5;
+  const STYLE_ID = "tm-modrewards-ux-style";
+  const LINK_CLASS = "tm-mod-link";
+  const TOTAL_ROW_ATTR = "data-tm-total-row";
+  const EXTRA_COLUMNS = [
+    { key: "modCount", label: "Unique DLs", format: "int" },
+    { key: "modValue", label: "Mod's DP", format: "int" },
+    { key: "value", label: "Your DP", format: "int" },
+    { key: "status", label: "Status", format: "int" },
+  ];
+
+  const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
+  const numberFormatter = new Intl.NumberFormat();
+  const percentFormatter = new Intl.NumberFormat(undefined, { maximumFractionDigits: 2 });
+  const modIdByName = new Map();
+  const modIdByNameAndGame = new Map();
+  const entryDataByNameAndGame = new Map();
+  const sortState = { index: -1, direction: "asc" };
+
+  let isSorting = false;
+  let isApplyingEnhancements = false;
+  let enhancementScheduled = false;
+  let lastFallbackFetchKey = "";
+  let reportObserver = null;
+  let observerRoot = null;
+  let observerPauseDepth = 0;
+
+  function pauseObserver() {
+    observerPauseDepth += 1;
+    if (observerPauseDepth === 1 && reportObserver) {
+      reportObserver.disconnect();
+    }
+  }
+
+  function resumeObserver() {
+    if (observerPauseDepth > 0) {
+      observerPauseDepth -= 1;
+    }
+
+    if (observerPauseDepth === 0 && reportObserver && observerRoot) {
+      reportObserver.observe(observerRoot, { childList: true, subtree: true });
+    }
+  }
+
+  function isReportsRoute() {
+    return window.location.hash.includes("/reports/");
+  }
+
+  function normalizeText(value) {
+    return String(value ?? "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .toLowerCase();
+  }
+
+  function toIntegerOrNull(value) {
+    const parsed = Number.parseInt(String(value ?? ""), 10);
+    return Number.isInteger(parsed) ? parsed : null;
+  }
+
+  function makeNameAndGameKey(modName, gameName) {
+    const normalizedModName = normalizeText(modName);
+    if (!normalizedModName) {
+      return "";
+    }
+
+    return `${normalizedModName}|${normalizeText(gameName)}`;
+  }
+
+  function isEnhancementEligible() {
+    if (!window.location.hash.includes("/reports/")) {
+      return false;
+    }
+
+    const parsed = parseYearAndMonthFromHash();
+    if (!parsed) {
+      return false;
+    }
+
+    if (parsed.year > CUTOFF_YEAR) {
+      return true;
+    }
+
+    return parsed.year === CUTOFF_YEAR && parsed.month > CUTOFF_MONTH;
+  }
+
+  function getStoreList() {
+    return document.querySelector("ul.store-items");
+  }
+
+  function getEntryRows() {
+    const list = getStoreList();
+    if (!list) {
+      return [];
+    }
+
+    return Array.from(list.children).filter(
+      (child) => child.querySelector(".report_entry") && child.getAttribute(TOTAL_ROW_ATTR) !== "1",
+    );
+  }
+
+  function getHeaderCells() {
+    const header = document.querySelector("ul.store-items .report_entry_head");
+    if (!header) {
+      return [];
+    }
+
+    return Array.from(header.children).filter(
+      (child) => child.classList && child.classList.contains("report_entry_head--title"),
+    );
+  }
+
+  function getEntryCells(rowElement) {
+    const entry = rowElement.querySelector(".report_entry");
+    if (!entry) {
+      return [];
+    }
+
+    return Array.from(entry.children).filter((child) => child.tagName === "SPAN");
+  }
+
+  function getCellText(rowElement, columnIndex) {
+    const cells = getEntryCells(rowElement);
+    const cell = cells[columnIndex];
+    if (!cell) {
+      return "";
+    }
+
+    const rawValue = cell.dataset.tmRawValue;
+    if (rawValue !== undefined && rawValue !== "") {
+      return rawValue;
+    }
+
+    return String(cell.textContent ?? "").replace(/\s+/g, " ").trim();
+  }
+
+  function parseNumericValue(value) {
+    let cleaned = String(value ?? "")
+      .replace(/[%$]/g, "")
+      .replace(/[\u00A0\u202F\s]/g, "")
+      .trim();
+
+    if (!cleaned || cleaned === "-") {
+      return NaN;
+    }
+
+    if (/^-?\d{1,3}(\.\d{3})+$/.test(cleaned)) {
+      cleaned = cleaned.replace(/\./g, "");
+    } else if (/^-?\d{1,3}(,\d{3})+$/.test(cleaned)) {
+      cleaned = cleaned.replace(/,/g, "");
+    } else {
+      cleaned = cleaned.replace(/,/g, ".");
+    }
+
+    const parsed = Number.parseFloat(cleaned);
+    return Number.isFinite(parsed) ? parsed : NaN;
+  }
+
+  function isNumericColumn(values) {
+    if (!values.length) {
+      return false;
+    }
+
+    return values.every((value) => {
+      const normalized = String(value ?? "").trim();
+      return (
+        !normalized ||
+        normalized === "-" ||
+        Number.isFinite(parseNumericValue(normalized))
+      );
+    });
+  }
+
+  function getDataColumnsTemplate() {
+    const valueIndex = EXTRA_COLUMNS.findIndex((column) => column.key === "value");
+    const beforeValueColumns =
+      valueIndex >= 0 ? EXTRA_COLUMNS.slice(0, valueIndex) : EXTRA_COLUMNS.slice();
+    const valueColumn = valueIndex >= 0 ? EXTRA_COLUMNS[valueIndex] : null;
+    const afterValueColumns = valueIndex >= 0 ? EXTRA_COLUMNS.slice(valueIndex + 1) : [];
+
+    const trackForColumn = (column) => {
+      if (column.key === "status") {
+        return "70px";
+      }
+
+      if (column.key === "modCount") {
+        return "120px";
+      }
+
+      if (column.key === "modValue" || column.key === "value") {
+        return "100px";
+      }
+
+      return "minmax(85px, 0.9fr)";
+    };
+
+    const tracks = [
+      ...beforeValueColumns.map(trackForColumn),
+      "minmax(85px, 0.9fr)",
+      ...(valueColumn ? [trackForColumn(valueColumn)] : []),
+      ...afterValueColumns.map(trackForColumn),
+    ];
+
+    return tracks.join("\n          ");
+  }
+
+  function ensureStyle() {
+    if (document.getElementById(STYLE_ID)) {
+      return;
+    }
+
+    const style = document.createElement("style");
+    style.id = STYLE_ID;
+    style.textContent = `
+      ul.store-items .report_entry_head .report_entry_head--title[data-tm-sortable="true"] {
+        cursor: pointer;
+        user-select: none;
+        position: relative;
+        padding-right: 14px;
+      }
+
+      ul.store-items .report_entry_head .report_entry_head--title[data-tm-sort-dir="asc"]::after {
+        content: "\\25B2";
+        position: absolute;
+        right: 0;
+        top: 50%;
+        transform: translateY(-50%);
+        font-size: 10px;
+        opacity: 0.8;
+      }
+
+      ul.store-items .report_entry_head .report_entry_head--title[data-tm-sort-dir="desc"]::after {
+        content: "\\25BC";
+        position: absolute;
+        right: 0;
+        top: 50%;
+        transform: translateY(-50%);
+        font-size: 10px;
+        opacity: 0.8;
+      }
+
+      a.${LINK_CLASS} {
+        color: inherit;
+        text-decoration: underline;
+      }
+
+      a.${LINK_CLASS}:hover {
+        color: #f9a93a;
+      }
+
+      ul.store-items {
+        overflow-x: auto;
+      }
+
+      ul.store-items .report_entry[data-tm-has-extra="1"],
+      ul.store-items .report_entry_head[data-tm-has-extra="1"] {
+        display: grid !important;
+        grid-template-columns:
+          minmax(240px, 2.4fr)
+          minmax(140px, 1.4fr)
+          ${getDataColumnsTemplate()};
+        column-gap: 10px;
+        align-items: center;
+      }
+
+      ul.store-items .report_entry[data-tm-has-extra="1"] > span,
+      ul.store-items .report_entry_head[data-tm-has-extra="1"] > .report_entry_head--title {
+        width: auto !important;
+        min-width: 0;
+      }
+
+      ul.store-items .report_entry_head[data-tm-has-extra="1"] > .report_entry_head--title {
+        text-align: center;
+        font-weight: 700;
+      }
+
+      ul.store-items .report_entry[data-tm-has-extra="1"] > span[data-tm-extra-col],
+      ul.store-items .report_entry_head[data-tm-has-extra="1"] > .report_entry_head--title[data-tm-extra-col] {
+        font-variant-numeric: tabular-nums;
+        color: #e1e1e1;
+      }
+
+      ul.store-items .report_entry_head[data-tm-has-extra="1"] > .report_entry_head--title:nth-child(2),
+      ul.store-items .report_entry[data-tm-has-extra="1"] > span:nth-child(2),
+      ul.store-items .report_entry_head[data-tm-has-extra="1"] > .report_entry_head--title:nth-child(2) *,
+      ul.store-items .report_entry[data-tm-has-extra="1"] > span:nth-child(2) *,
+      ul.store-items .report_entry[data-tm-has-extra="1"] > span[data-tm-extra-col="status"],
+      ul.store-items .report_entry_head[data-tm-has-extra="1"] > .report_entry_head--title[data-tm-extra-col="status"],
+      ul.store-items .report_entry[data-tm-has-extra="1"] > span[data-tm-extra-col="status"] *,
+      ul.store-items .report_entry_head[data-tm-has-extra="1"] > .report_entry_head--title[data-tm-extra-col="status"] * {
+        color: #9a9a9a !important;
+      }
+
+      ul.store-items .report_entry[data-tm-has-extra="1"] > span[data-tm-extra-col] {
+        text-align: right;
+      }
+
+      ul.store-items .report_entry[data-tm-has-extra="1"] > span[data-tm-extra-col="status"],
+      ul.store-items .report_entry_head[data-tm-has-extra="1"] > .report_entry_head--title[data-tm-extra-col="status"] {
+        text-align: center;
+      }
+
+      ul.store-items li[${TOTAL_ROW_ATTR}="1"] .report_entry {
+        margin-top: 6px;
+        padding-top: 6px;
+        border-top: 1px solid rgba(255, 255, 255, 0.2);
+        font-weight: 700;
+      }
+
+      ul.store-items li[${TOTAL_ROW_ATTR}="1"] .report_entry > span {
+        color: #e1e1e1 !important;
+      }
+
+      ul.store-items li[${TOTAL_ROW_ATTR}="1"] .report_entry > span * {
+        color: #e1e1e1 !important;
+      }
+
+      ul.store-items li[${TOTAL_ROW_ATTR}="1"] .report_entry > span[data-tm-total-game="1"],
+      ul.store-items li[${TOTAL_ROW_ATTR}="1"] .report_entry > span[data-tm-total-ratio="1"] {
+        text-align: center;
+      }
+    `;
+
+    if (document.head) {
+      document.head.appendChild(style);
+      return;
+    }
+
+    document.documentElement.appendChild(style);
+  }
+
+  function updateSortIndicators() {
+    const cells = getHeaderCells();
+    for (const [index, cell] of cells.entries()) {
+      if (index === sortState.index) {
+        cell.dataset.tmSortDir = sortState.direction;
+      } else {
+        cell.removeAttribute("data-tm-sort-dir");
+      }
+    }
+  }
+
+  function sortRowsInPlace() {
+    if (sortState.index < 0) {
+      return;
+    }
+
+    const list = getStoreList();
+    if (!list) {
+      return;
+    }
+
+    const totalRow = list.querySelector(`li[${TOTAL_ROW_ATTR}="1"]`);
+
+    const rows = getEntryRows();
+    if (rows.length < 2) {
+      if (totalRow && list.lastElementChild !== totalRow) {
+        pauseObserver();
+        try {
+          list.appendChild(totalRow);
+        } finally {
+          resumeObserver();
+        }
+      }
+      return;
+    }
+
+    const values = rows.map((row) => getCellText(row, sortState.index));
+    const numericColumn = isNumericColumn(values);
+    const items = rows.map((row, index) => ({
+      row,
+      index,
+      textValue: values[index],
+      numericValue: parseNumericValue(values[index]),
+    }));
+
+    items.sort((left, right) => {
+      let comparison = 0;
+
+      if (numericColumn) {
+        const leftValue = Number.isFinite(left.numericValue) ? left.numericValue : -Infinity;
+        const rightValue = Number.isFinite(right.numericValue) ? right.numericValue : -Infinity;
+        comparison = leftValue - rightValue;
+      } else {
+        comparison = collator.compare(left.textValue, right.textValue);
+      }
+
+      if (comparison !== 0) {
+        return sortState.direction === "asc" ? comparison : -comparison;
+      }
+
+      // Keep equal values stable in both ASC and DESC to avoid oscillation.
+      return left.index - right.index;
+    });
+
+    const isSameOrder = items.every((item, index) => item.row === rows[index]);
+    if (isSameOrder) {
+      if (totalRow && list.lastElementChild !== totalRow) {
+        pauseObserver();
+        try {
+          list.appendChild(totalRow);
+        } finally {
+          resumeObserver();
+        }
+      }
+      return;
+    }
+
+    pauseObserver();
+    isSorting = true;
+    try {
+      for (const item of items) {
+        list.appendChild(item.row);
+      }
+
+      if (totalRow) {
+        list.appendChild(totalRow);
+      }
+    } finally {
+      isSorting = false;
+      resumeObserver();
+    }
+  }
+
+  function onHeaderClick(event) {
+    if (!isEnhancementEligible()) {
+      return;
+    }
+
+    const cell = event.currentTarget;
+    const columnIndex = Number.parseInt(cell.dataset.tmSortIndex ?? "", 10);
+    if (!Number.isInteger(columnIndex)) {
+      return;
+    }
+
+    if (sortState.index === columnIndex) {
+      sortState.direction = sortState.direction === "asc" ? "desc" : "asc";
+    } else {
+      sortState.index = columnIndex;
+      sortState.direction = "desc";
+    }
+
+    updateSortIndicators();
+    sortRowsInPlace();
+  }
+
+  function bindHeaderSorting() {
+    const cells = getHeaderCells();
+    if (!cells.length) {
+      return;
+    }
+
+    for (const [index, cell] of cells.entries()) {
+      cell.dataset.tmSortable = "true";
+      cell.dataset.tmSortIndex = String(index);
+
+      if (cell.dataset.tmSortBound !== "1") {
+        cell.dataset.tmSortBound = "1";
+        cell.addEventListener("click", onHeaderClick, true);
+      }
+    }
+
+    updateSortIndicators();
+  }
+
+  function resolveModId(modName, gameName) {
+    const modKey = normalizeText(modName);
+    if (!modKey) {
+      return null;
+    }
+
+    const gameKey = normalizeText(gameName);
+    if (gameKey) {
+      const gameSpecificKey = `${modKey}|${gameKey}`;
+      if (modIdByNameAndGame.has(gameSpecificKey)) {
+        return modIdByNameAndGame.get(gameSpecificKey);
+      }
+    }
+
+    return modIdByName.get(modKey) ?? null;
+  }
+
+  function resolveEntryData(modName, gameName) {
+    const key = makeNameAndGameKey(modName, gameName);
+    if (!key) {
+      return null;
+    }
+
+    return entryDataByNameAndGame.get(key) ?? null;
+  }
+
+  function formatExtraColumnValue(value, format) {
+    if (value === null || value === undefined || value === "") {
+      return "-";
+    }
+
+    if (format === "int") {
+      const parsed = Number.parseInt(String(value), 10);
+      if (Number.isInteger(parsed)) {
+        return numberFormatter.format(parsed);
+      }
+    }
+
+    return String(value);
+  }
+
+  function formatRatioPercent(value) {
+    if (!Number.isFinite(value)) {
+      return "-";
+    }
+
+    return `${percentFormatter.format(value)}%`;
+  }
+
+  function removeTotalRow() {
+    const list = getStoreList();
+    if (!list) {
+      return;
+    }
+
+    const totalRow = list.querySelector(`li[${TOTAL_ROW_ATTR}="1"]`);
+    if (totalRow) {
+      totalRow.remove();
+    }
+  }
+
+  function createTotalCell(text, extraKey, rawValue) {
+    const cell = document.createElement("span");
+    if (extraKey) {
+      cell.dataset.tmExtraCol = extraKey;
+    }
+
+    if (Number.isFinite(rawValue)) {
+      cell.dataset.tmRawValue = String(rawValue);
+    }
+
+    cell.textContent = text;
+    return cell;
+  }
+
+  function upsertTotalRow(hasRows, totalsByKey) {
+    const list = getStoreList();
+    if (!list) {
+      return;
+    }
+
+    let totalRow = list.querySelector(`li[${TOTAL_ROW_ATTR}="1"]`);
+    if (!hasRows) {
+      if (totalRow) {
+        totalRow.remove();
+      }
+      return;
+    }
+
+    if (!totalRow) {
+      totalRow = document.createElement("li");
+      totalRow.setAttribute(TOTAL_ROW_ATTR, "1");
+      const totalEntry = document.createElement("div");
+      totalEntry.className = "report_entry";
+      totalRow.appendChild(totalEntry);
+      list.appendChild(totalRow);
+    }
+
+    const totalEntry = totalRow.querySelector(".report_entry");
+    if (!totalEntry) {
+      return;
+    }
+
+    totalEntry.dataset.tmHasExtra = "1";
+    totalEntry.textContent = "";
+
+    totalEntry.appendChild(createTotalCell("Total"));
+    const totalGameCell = createTotalCell("-");
+    totalGameCell.dataset.tmTotalGame = "1";
+    totalEntry.appendChild(totalGameCell);
+
+    const valueIndex = EXTRA_COLUMNS.findIndex((column) => column.key === "value");
+    const beforeValueColumns =
+      valueIndex >= 0 ? EXTRA_COLUMNS.slice(0, valueIndex) : EXTRA_COLUMNS.slice();
+    const valueColumn = valueIndex >= 0 ? EXTRA_COLUMNS[valueIndex] : null;
+    const afterValueColumns = valueIndex >= 0 ? EXTRA_COLUMNS.slice(valueIndex + 1) : [];
+
+    const appendTotalForColumn = (column) => {
+      const totalValue = totalsByKey[column.key];
+      const isStatus = column.key === "status";
+      const displayValue = isStatus ? "-" : formatExtraColumnValue(totalValue, column.format);
+      totalEntry.appendChild(createTotalCell(displayValue, column.key, isStatus ? NaN : totalValue));
+    };
+
+    for (const column of beforeValueColumns) {
+      appendTotalForColumn(column);
+    }
+
+    const totalModValue = Number(totalsByKey.modValue ?? 0);
+    const totalValue = Number(totalsByKey.value ?? 0);
+    const totalRatioPercent =
+      Number.isFinite(totalModValue) && totalModValue > 0 && Number.isFinite(totalValue)
+        ? (totalValue / totalModValue) * 100
+        : NaN;
+
+    const totalRatioCell = createTotalCell(
+      formatRatioPercent(totalRatioPercent),
+      undefined,
+      totalRatioPercent,
+    );
+    totalRatioCell.dataset.tmTotalRatio = "1";
+    totalEntry.appendChild(totalRatioCell);
+
+    if (valueColumn) {
+      appendTotalForColumn(valueColumn);
+    }
+
+    for (const column of afterValueColumns) {
+      appendTotalForColumn(column);
+    }
+
+    if (list.lastElementChild !== totalRow) {
+      list.appendChild(totalRow);
+    }
+  }
+
+  function cleanupEnhancements() {
+    removeTotalRow();
+
+    const header = document.querySelector("ul.store-items .report_entry_head");
+    if (header) {
+      header.removeAttribute("data-tm-has-extra");
+      const extraHeaders = header.querySelectorAll(".report_entry_head--title[data-tm-extra-col]");
+      for (const node of extraHeaders) {
+        node.remove();
+      }
+
+      const allHeaders = header.querySelectorAll(".report_entry_head--title");
+      for (const cell of allHeaders) {
+        cell.removeAttribute("data-tm-sort-dir");
+      }
+    }
+
+    const entries = document.querySelectorAll("ul.store-items .report_entry");
+    for (const entry of entries) {
+      entry.removeAttribute("data-tm-has-extra");
+      const extraCells = entry.querySelectorAll("span[data-tm-extra-col]");
+      for (const node of extraCells) {
+        node.remove();
+      }
+    }
+
+    const links = document.querySelectorAll(`a.${LINK_CLASS}`);
+    for (const link of links) {
+      const text = document.createTextNode(link.textContent ?? "");
+      link.replaceWith(text);
+    }
+
+    sortState.index = -1;
+    sortState.direction = "asc";
+  }
+
+  function applyExtraColumns() {
+    const header = document.querySelector("ul.store-items .report_entry_head");
+    if (!header) {
+      return;
+    }
+
+    header.dataset.tmHasExtra = "1";
+
+    for (const column of EXTRA_COLUMNS) {
+      let headerCell = header.querySelector(
+        `.report_entry_head--title[data-tm-extra-col="${column.key}"]`,
+      );
+
+      if (!headerCell) {
+        headerCell = document.createElement("span");
+        headerCell.className = "report_entry_head--title";
+        headerCell.dataset.tmExtraCol = column.key;
+        header.appendChild(headerCell);
+      }
+
+      headerCell.textContent = column.label;
+    }
+
+    const rows = getEntryRows();
+    if (!rows.length) {
+      upsertTotalRow(false, {});
+      return;
+    }
+
+    const totalsByKey = {};
+    for (const column of EXTRA_COLUMNS) {
+      totalsByKey[column.key] = 0;
+    }
+
+    for (const row of rows) {
+      const cells = getEntryCells(row);
+      if (cells.length < 2) {
+        continue;
+      }
+
+      const rowEntry = row.querySelector(".report_entry");
+      if (!rowEntry) {
+        continue;
+      }
+
+      rowEntry.dataset.tmHasExtra = "1";
+
+      const modName = String(cells[0].textContent ?? "").replace(/\s+/g, " ").trim();
+      const gameName = String(cells[1].textContent ?? "").replace(/\s+/g, " ").trim();
+      const entryData = resolveEntryData(modName, gameName);
+
+      for (const column of EXTRA_COLUMNS) {
+        let extraCell = rowEntry.querySelector(`span[data-tm-extra-col="${column.key}"]`);
+
+        if (!extraCell) {
+          extraCell = document.createElement("span");
+          extraCell.dataset.tmExtraCol = column.key;
+          rowEntry.appendChild(extraCell);
+        }
+
+        const rawValue = entryData?.[column.key];
+        if (column.key !== "status" && Number.isFinite(rawValue)) {
+          totalsByKey[column.key] += rawValue;
+        }
+
+        if (column.format === "int" && Number.isInteger(rawValue)) {
+          extraCell.dataset.tmRawValue = String(rawValue);
+        } else {
+          delete extraCell.dataset.tmRawValue;
+        }
+
+        extraCell.textContent = formatExtraColumnValue(rawValue, column.format);
+      }
+    }
+
+    const headerBaseCells = Array.from(header.children).filter(
+      (child) =>
+        child.classList &&
+        child.classList.contains("report_entry_head--title") &&
+        !child.dataset.tmExtraCol,
+    );
+    const ratioHeaderCell = headerBaseCells[2];
+    const valueHeaderCell = header.querySelector('.report_entry_head--title[data-tm-extra-col="value"]');
+    if (ratioHeaderCell && valueHeaderCell) {
+      header.insertBefore(ratioHeaderCell, valueHeaderCell);
+    }
+
+    for (const row of rows) {
+      const rowEntry = row.querySelector(".report_entry");
+      if (!rowEntry) {
+        continue;
+      }
+
+      const rowBaseCells = Array.from(rowEntry.children).filter(
+        (child) => child.tagName === "SPAN" && !child.dataset.tmExtraCol,
+      );
+      const ratioCell = rowBaseCells[2];
+      const valueCell = rowEntry.querySelector('span[data-tm-extra-col="value"]');
+      if (ratioCell) {
+        const ratioRawValue = parseNumericValue(ratioCell.textContent);
+        if (Number.isFinite(ratioRawValue)) {
+          ratioCell.dataset.tmRawValue = String(ratioRawValue);
+        } else {
+          delete ratioCell.dataset.tmRawValue;
+        }
+      }
+      if (ratioCell && valueCell) {
+        rowEntry.insertBefore(ratioCell, valueCell);
+      }
+    }
+
+    upsertTotalRow(true, totalsByKey);
+  }
+
+  function applyModLinks() {
+    const rows = getEntryRows();
+    if (!rows.length) {
+      return;
+    }
+
+    for (const row of rows) {
+      const cells = getEntryCells(row);
+      if (!cells.length) {
+        continue;
+      }
+
+      const modCell = cells[0];
+      const gameCell = cells[1];
+      const modName = String(modCell.textContent ?? "").replace(/\s+/g, " ").trim();
+      const gameName = String(gameCell?.textContent ?? "").replace(/\s+/g, " ").trim();
+      if (!modName) {
+        continue;
+      }
+
+      const modId = resolveModId(modName, gameName);
+      if (!modId) {
+        continue;
+      }
+
+      const url = `https://www.nexusmods.com/${GAME_SLUG}/mods/${modId}`;
+      const existingLink = modCell.querySelector(`a.${LINK_CLASS}`);
+      if (existingLink) {
+        existingLink.href = url;
+        existingLink.target = "_blank";
+        existingLink.rel = "noopener noreferrer";
+        continue;
+      }
+
+      const link = document.createElement("a");
+      link.className = LINK_CLASS;
+      link.href = url;
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+      link.textContent = modName;
+
+      modCell.textContent = "";
+      modCell.appendChild(link);
+    }
+  }
+
+  function rememberEntriesFromPayload(payload) {
+    const entries = payload?.message?.data?.userMonthlyReport?.entries;
+    if (!Array.isArray(entries) || !entries.length) {
+      return;
+    }
+
+    let hasUpdates = false;
+
+    for (const entry of entries) {
+      const modName = entry?.mod?.name;
+      const gameName = entry?.game?.name;
+      const modId = Number(entry?.modId);
+      const entryKey = makeNameAndGameKey(modName, gameName);
+
+      if (!modName || !Number.isInteger(modId)) {
+        continue;
+      }
+
+      const modKey = normalizeText(modName);
+      if (!modKey) {
+        continue;
+      }
+
+      if (!modIdByName.has(modKey)) {
+        modIdByName.set(modKey, modId);
+        hasUpdates = true;
+      }
+
+      const gameKey = normalizeText(gameName);
+      if (gameKey) {
+        const gameSpecificKey = `${modKey}|${gameKey}`;
+        if (!modIdByNameAndGame.has(gameSpecificKey)) {
+          modIdByNameAndGame.set(gameSpecificKey, modId);
+          hasUpdates = true;
+        }
+      }
+
+      if (entryKey) {
+        const nextEntryData = {
+          modId: toIntegerOrNull(entry?.modId),
+          gameId: toIntegerOrNull(entry?.gameId),
+          modCount: toIntegerOrNull(entry?.modCount),
+          modValue: toIntegerOrNull(entry?.modValue),
+          value: toIntegerOrNull(entry?.value),
+          reportId: toIntegerOrNull(entry?.reportId),
+          status: toIntegerOrNull(entry?.status),
+          month: toIntegerOrNull(entry?.month),
+          year: toIntegerOrNull(entry?.year),
+        };
+
+        const currentEntryData = entryDataByNameAndGame.get(entryKey);
+        const hasEntryChanged = EXTRA_COLUMNS.some(
+          (column) => currentEntryData?.[column.key] !== nextEntryData[column.key],
+        );
+
+        if (!currentEntryData || hasEntryChanged) {
+          entryDataByNameAndGame.set(entryKey, nextEntryData);
+          hasUpdates = true;
+        }
+      }
+    }
+
+    if (hasUpdates && isEnhancementEligible()) {
+      scheduleEnhancement();
+    }
+  }
+
+  function isModEntriesUrl(url) {
+    return typeof url === "string" && url.includes(MOD_ENTRIES_URL_FRAGMENT);
+  }
+
+  function patchFetch() {
+    if (typeof window.fetch !== "function" || window.fetch.__tmModRewardsWrapped) {
+      return;
+    }
+
+    const nativeFetch = window.fetch.bind(window);
+
+    const wrappedFetch = (...args) =>
+      nativeFetch(...args).then((response) => {
+        try {
+          const request = args[0];
+          const url =
+            typeof request === "string"
+              ? request
+              : request && typeof request.url === "string"
+                ? request.url
+                : "";
+
+          if (isModEntriesUrl(url)) {
+            response
+              .clone()
+              .json()
+              .then((payload) => {
+                rememberEntriesFromPayload(payload);
+              })
+              .catch(() => {});
+          }
+        } catch (_) {
+          // Ignore response parsing errors.
+        }
+
+        return response;
+      });
+
+    wrappedFetch.__tmModRewardsWrapped = true;
+    window.fetch = wrappedFetch;
+  }
+
+  function patchXMLHttpRequest() {
+    const proto = XMLHttpRequest.prototype;
+    if (proto.open.__tmModRewardsWrapped) {
+      return;
+    }
+
+    const nativeOpen = proto.open;
+    const nativeSend = proto.send;
+
+    proto.open = function patchedOpen(method, url, ...rest) {
+      this.__tmModRewardsUrl = typeof url === "string" ? url : "";
+      return nativeOpen.call(this, method, url, ...rest);
+    };
+
+    proto.send = function patchedSend(...args) {
+      if (isModEntriesUrl(this.__tmModRewardsUrl)) {
+        this.addEventListener("load", () => {
+          if (typeof this.responseText !== "string") {
+            return;
+          }
+
+          try {
+            const payload = JSON.parse(this.responseText);
+            rememberEntriesFromPayload(payload);
+          } catch (_) {
+            // Ignore response parsing errors.
+          }
+        });
+      }
+
+      return nativeSend.apply(this, args);
+    };
+
+    proto.open.__tmModRewardsWrapped = true;
+  }
+
+  function parseYearAndMonthFromHash() {
+    const match = window.location.hash.match(/^#\/reports\/(\d{4})\/(\d{1,2})(?:\/\d+)?$/);
+    if (!match) {
+      return null;
+    }
+
+    const year = Number.parseInt(match[1], 10);
+    const month = Number.parseInt(match[2], 10);
+    if (!Number.isInteger(year) || !Number.isInteger(month) || month < 1 || month > 12) {
+      return null;
+    }
+
+    return { year, month };
+  }
+
+  async function fetchEntriesForCurrentRoute() {
+    if (!isEnhancementEligible()) {
+      return;
+    }
+
+    const parsed = parseYearAndMonthFromHash();
+    if (!parsed) {
+      return;
+    }
+
+    const key = `${parsed.year}-${parsed.month}`;
+    if (key === lastFallbackFetchKey) {
+      return;
+    }
+    lastFallbackFetchKey = key;
+
+    const url = `/Core/Libs/Common/Managers/ModRewards?GetEntries&year=${parsed.year}&month=${parsed.month}`;
+
+    try {
+      const response = await window.fetch(url, { credentials: "include" });
+      if (!response.ok) {
+        return;
+      }
+
+      const payload = await response.json();
+      rememberEntriesFromPayload(payload);
+    } catch (_) {
+      // Ignore network errors in fallback fetch.
+    }
+  }
+
+  function enhancePage() {
+    if (!isReportsRoute()) {
+      return;
+    }
+
+    pauseObserver();
+    isApplyingEnhancements = true;
+    try {
+    if (!isEnhancementEligible()) {
+      cleanupEnhancements();
+      return;
+    }
+
+    ensureStyle();
+    applyExtraColumns();
+    bindHeaderSorting();
+    applyModLinks();
+    sortRowsInPlace();
+    } finally {
+      isApplyingEnhancements = false;
+      resumeObserver();
+    }
+  }
+
+  function scheduleEnhancement() {
+    if (enhancementScheduled) {
+      return;
+    }
+
+    enhancementScheduled = true;
+    window.requestAnimationFrame(() => {
+      enhancementScheduled = false;
+      enhancePage();
+    });
+  }
+
+  function startObserver() {
+    const connect = () => {
+      if (!document.body) {
+        window.requestAnimationFrame(connect);
+        return;
+      }
+
+      observerRoot = document.body;
+      reportObserver = new MutationObserver(() => {
+        if (!isSorting && !isApplyingEnhancements && observerPauseDepth === 0) {
+          scheduleEnhancement();
+        }
+      });
+
+      reportObserver.observe(observerRoot, { childList: true, subtree: true });
+      scheduleEnhancement();
+    };
+
+    connect();
+  }
+
+  patchFetch();
+  patchXMLHttpRequest();
+
+  window.addEventListener("hashchange", () => {
+    scheduleEnhancement();
+    fetchEntriesForCurrentRoute();
+  });
+
+  if (document.readyState === "loading") {
+    document.addEventListener(
+      "DOMContentLoaded",
+      () => {
+        scheduleEnhancement();
+        fetchEntriesForCurrentRoute();
+      },
+      { once: true },
+    );
+  } else {
+    scheduleEnhancement();
+    fetchEntriesForCurrentRoute();
+  }
+
+  window.setTimeout(fetchEntriesForCurrentRoute, 1250);
+  startObserver();
+})();
