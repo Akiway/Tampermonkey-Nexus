@@ -1,9 +1,9 @@
 // ==UserScript==
-// @name         Nexus ModRewards UX Enhancer
+// @name         Nexus Mods Enhancer - Mod Rewards
 // @namespace    https://github.com/Akiway
 // @author       Akiway
-// @version      1.3.1
-// @description  Adds sortable columns, mod links, extra fields, totals on reports, and wallet enhancements.
+// @version      1.3.2
+// @description  Adds sortable columns, mod links, extra fields, totals on reports, wallet and opt-in pages enhancements.
 // @match        https://www.nexusmods.com/modrewards*
 // @match        https://www.nexusmods.com/*/modrewards*
 // @updateURL    https://github.com/Akiway/Tampermonkey-Nexus/raw/refs/heads/main/scripts/modrewards-ux.user.js
@@ -1097,7 +1097,7 @@
         z-index: 2147483647;
         padding: 8px 12px;
         border-radius: 8px;
-        border: 1px solid rgba(249, 169, 58, 0.55);
+        border: 1px solid var(--primary-subdued, #c87b28);
         background: rgba(14, 14, 14, 0.50);
         color: #e6e6e6;
         font-size: 12px;
@@ -1111,10 +1111,12 @@
 
       #${NOTICE_ID} .tm-notice-author-link {
         text-decoration: none;
+        color: var(--primary-strong, #e0a362);
+        transition: filter 225ms ease;
       }
 
       #${NOTICE_ID} .tm-notice-author-link:hover {
-        color: #f9a93a;
+        filter: brightness(120%);
       }
 
       #${NOTICE_ID} .tm-notice-inline-icon {
@@ -1146,19 +1148,21 @@
         gap: 6px;
         padding: 4px 9px;
         border-radius: 5px;
-        border: 1px solid rgba(249, 169, 58, 0.75);
+        border: 1px solid var(--primary-moderate, #d98f40);
         background: #1f1f1f;
         color: #f1f1f1;
         text-decoration: none;
         font-size: 12px;
         font-weight: 600;
         letter-spacing: 0.1px;
+        transition: filter 225ms ease;
       }
 
       #${NOTICE_ID} .tm-notice-btn:hover {
         background: #2a2a2a;
-        border-color: #f9a93a;
+        border-color: var(--primary-strong, #e0a362);
         color: #ffffff;
+        filter: brightness(120%);
       }
 
       #${NOTICE_ID} .tm-notice-btn-icon {
