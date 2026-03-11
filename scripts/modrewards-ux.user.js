@@ -2,7 +2,7 @@
 // @name         Nexus ModRewards UX Enhancer
 // @namespace    https://github.com/Akiway
 // @author       Akiway
-// @version      1.3.0
+// @version      1.3.1
 // @description  Adds sortable columns, mod links, extra fields, totals on reports, and wallet enhancements.
 // @match        https://www.nexusmods.com/modrewards*
 // @match        https://www.nexusmods.com/*/modrewards*
@@ -951,6 +951,9 @@
       ul.mod-items[data-tm-mods-enhanced="1"] > li[data-tm-mods-row="1"] > div > div.tm-mod-status-col {
         width: 9% !important;
         text-align: center;
+        display: inline-flex !important;
+        justify-content: center;
+        align-items: center;
       }
 
       ul.mod-items[data-tm-mods-enhanced="1"] > li[data-tm-mods-header="1"] > div.mod-name-col,
@@ -982,6 +985,8 @@
         width: 24px;
         display: block;
         margin: 0 auto !important;
+        float: none !important;
+        flex: none !important;
       }
 
       ul.mod-items[data-tm-mods-enhanced="1"] > li[data-tm-mods-header="1"] > div {
