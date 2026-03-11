@@ -2,8 +2,8 @@
 // @name         Nexus ModRewards UX Enhancer
 // @namespace    https://github.com/Akiway
 // @author       Akiway
-// @version      1.0.0
-// @description  Adds sortable columns, mod links, extra fields, and totals on legacy Nexus ModRewards reports.
+// @version      1.1.0
+// @description  Adds sortable columns, mod links, extra fields, totals on reports, and wallet enhancements.
 // @match        https://www.nexusmods.com/modrewards*
 // @run-at       document-start
 // @grant        none
@@ -14,12 +14,15 @@
 
   const GAME_SLUG = "cyberpunk2077";
   const MOD_ENTRIES_URL_FRAGMENT = "/Core/Libs/Common/Managers/ModRewards?GetEntries";
+  const MOD_SUMMARY_URL_FRAGMENT = "/Core/Libs/Common/Managers/ModRewards?GetSummary";
   const CUTOFF_YEAR = 2024;
   const CUTOFF_MONTH = 5;
   const STYLE_ID = "tm-modrewards-ux-style";
   const NOTICE_ID = "tm-modrewards-notice";
   const LINK_CLASS = "tm-mod-link";
   const TOTAL_ROW_ATTR = "data-tm-total-row";
+  const WALLET_SEPARATOR_ATTR = "data-tm-wallet-separator";
+  const WALLET_SEPARATOR_TEXT = "Beginning of the new Donation Point System.";
   const EXTRA_COLUMNS = [
     { key: "modCount", label: "Unique DLs", format: "int" },
     { key: "modValue", label: "Mod's DP", format: "int" },
@@ -28,17 +31,20 @@
   ];
 
   const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
-  const numberFormatter = new Intl.NumberFormat();
+  const numberFormatter = new Intl.NumberFormat("en-US");
   const percentFormatter = new Intl.NumberFormat(undefined, { maximumFractionDigits: 2 });
   const modIdByName = new Map();
   const modIdByNameAndGame = new Map();
   const entryDataByNameAndGame = new Map();
+  const summaryDataByYearAndMonth = new Map();
   const sortState = { index: -1, direction: "asc" };
 
   let isSorting = false;
   let isApplyingEnhancements = false;
   let enhancementScheduled = false;
   let lastFallbackFetchKey = "";
+  let hasSummaryFallbackFetchSucceeded = false;
+  let isSummaryFallbackFetchInFlight = false;
   let reportObserver = null;
   let observerRoot = null;
   let observerPauseDepth = 0;
@@ -64,6 +70,10 @@
     return window.location.hash.includes("/reports/");
   }
 
+  function isWalletRoute() {
+    return window.location.hash.includes("/wallet");
+  }
+
   function normalizeText(value) {
     return String(value ?? "")
       .replace(/\s+/g, " ")
@@ -83,6 +93,14 @@
     }
 
     return `${normalizedModName}|${normalizeText(gameName)}`;
+  }
+
+  function makeYearAndMonthKey(year, month) {
+    if (!Number.isInteger(year) || !Number.isInteger(month)) {
+      return "";
+    }
+
+    return `${year}-${month}`;
   }
 
   function isEnhancementEligible() {
@@ -336,6 +354,21 @@
       ul.store-items li[${TOTAL_ROW_ATTR}="1"] .report_entry > span[data-tm-total-game="1"],
       ul.store-items li[${TOTAL_ROW_ATTR}="1"] .report_entry > span[data-tm-total-ratio="1"] {
         text-align: center;
+      }
+
+      #store-items ul.store-items li[${WALLET_SEPARATOR_ATTR}="1"] .con-vs-alert,
+      #store-items ul.store-items li[${WALLET_SEPARATOR_ATTR}="1"] .vs-alert {
+        box-shadow: none !important;
+      }
+
+      #store-items ul.store-items li[${WALLET_SEPARATOR_ATTR}="1"] .vs-alert {
+        font-size: 14px !important;
+        line-height: 18.2px !important;
+      }
+
+      #store-items ul.store-items li[${WALLET_SEPARATOR_ATTR}="1"] .vs-alert .vs-icon {
+        font-size: 14px !important;
+        line-height: 18.2px !important;
       }
 
       #${NOTICE_ID} {
@@ -828,6 +861,7 @@
   function cleanupEnhancements() {
     removeTotalRow();
     removeEnhancementNotice();
+    removeWalletReportSeparators();
 
     const header = document.querySelector("ul.store-items .report_entry_head");
     if (header) {
@@ -860,6 +894,38 @@
 
     sortState.index = -1;
     sortState.direction = "asc";
+  }
+
+  function removeWalletReportSeparators() {
+    const separatorRows = document.querySelectorAll(
+      `#store-items ul.store-items li[${WALLET_SEPARATOR_ATTR}="1"]`,
+    );
+    for (const row of separatorRows) {
+      row.remove();
+    }
+  }
+
+  function createWalletReportSeparatorRow() {
+    const row = document.createElement("li");
+    row.setAttribute(WALLET_SEPARATOR_ATTR, "1");
+
+    const alertWrap = document.createElement("div");
+    alertWrap.className = "con-vs-alert con-vs-alert-warning con-icon";
+    alertWrap.style.height = "38px";
+
+    const alertBody = document.createElement("div");
+    alertBody.className = "vs-alert con-icon";
+
+    const icon = document.createElement("i");
+    icon.className = "vs-icon notranslate icon-scale icon-alert material-icons null";
+    icon.textContent = "info";
+
+    alertBody.appendChild(icon);
+    alertBody.appendChild(document.createTextNode(` ${WALLET_SEPARATOR_TEXT}`));
+    alertWrap.appendChild(alertBody);
+    row.appendChild(alertWrap);
+
+    return row;
   }
 
   function applyExtraColumns() {
@@ -1093,6 +1159,54 @@
     return typeof url === "string" && url.includes(MOD_ENTRIES_URL_FRAGMENT);
   }
 
+  function isModSummaryUrl(url) {
+    return typeof url === "string" && url.includes(MOD_SUMMARY_URL_FRAGMENT);
+  }
+
+  function rememberSummaryFromPayload(payload) {
+    const entries = payload?.message?.entries;
+    if (!Array.isArray(entries) || !entries.length) {
+      return;
+    }
+
+    let hasUpdates = false;
+
+    for (const entry of entries) {
+      const year = toIntegerOrNull(entry?.year);
+      const month = toIntegerOrNull(entry?.month);
+      const key = makeYearAndMonthKey(year, month);
+      if (!key) {
+        continue;
+      }
+
+      const nextSummaryData = {
+        reportType: String(entry?.report_type ?? entry?.reportType ?? "").trim(),
+        modCount: toIntegerOrNull(entry?.mod_count ?? entry?.modCount),
+        modValue: toIntegerOrNull(entry?.mod_value ?? entry?.modValue),
+        value: toIntegerOrNull(entry?.value),
+        reportId: toIntegerOrNull(entry?.report_id ?? entry?.reportId),
+      };
+
+      const currentSummaryData = summaryDataByYearAndMonth.get(key);
+      const hasChanged =
+        !currentSummaryData ||
+        currentSummaryData.reportType !== nextSummaryData.reportType ||
+        currentSummaryData.modCount !== nextSummaryData.modCount ||
+        currentSummaryData.modValue !== nextSummaryData.modValue ||
+        currentSummaryData.value !== nextSummaryData.value ||
+        currentSummaryData.reportId !== nextSummaryData.reportId;
+
+      if (hasChanged) {
+        summaryDataByYearAndMonth.set(key, nextSummaryData);
+        hasUpdates = true;
+      }
+    }
+
+    if (hasUpdates && isWalletRoute()) {
+      scheduleEnhancement();
+    }
+  }
+
   function patchFetch() {
     if (typeof window.fetch !== "function" || window.fetch.__tmModRewardsWrapped) {
       return;
@@ -1111,12 +1225,19 @@
                 ? request.url
                 : "";
 
+          let handler = null;
           if (isModEntriesUrl(url)) {
+            handler = rememberEntriesFromPayload;
+          } else if (isModSummaryUrl(url)) {
+            handler = rememberSummaryFromPayload;
+          }
+
+          if (handler) {
             response
               .clone()
               .json()
               .then((payload) => {
-                rememberEntriesFromPayload(payload);
+                handler(payload);
               })
               .catch(() => {});
           }
@@ -1146,7 +1267,14 @@
     };
 
     proto.send = function patchedSend(...args) {
+      let handler = null;
       if (isModEntriesUrl(this.__tmModRewardsUrl)) {
+        handler = rememberEntriesFromPayload;
+      } else if (isModSummaryUrl(this.__tmModRewardsUrl)) {
+        handler = rememberSummaryFromPayload;
+      }
+
+      if (handler) {
         this.addEventListener("load", () => {
           if (typeof this.responseText !== "string") {
             return;
@@ -1154,7 +1282,7 @@
 
           try {
             const payload = JSON.parse(this.responseText);
-            rememberEntriesFromPayload(payload);
+            handler(payload);
           } catch (_) {
             // Ignore response parsing errors.
           }
@@ -1165,6 +1293,21 @@
     };
 
     proto.open.__tmModRewardsWrapped = true;
+  }
+
+  function parseYearAndMonthFromReportHref(href) {
+    const match = String(href ?? "").match(/#\/reports\/(\d{4})\/(\d{1,2})(?:\/\d+)?$/);
+    if (!match) {
+      return null;
+    }
+
+    const year = Number.parseInt(match[1], 10);
+    const month = Number.parseInt(match[2], 10);
+    if (!Number.isInteger(year) || !Number.isInteger(month) || month < 1 || month > 12) {
+      return null;
+    }
+
+    return { year, month };
   }
 
   function parseYearAndMonthFromHash() {
@@ -1213,8 +1356,94 @@
     }
   }
 
+  async function fetchSummaryForCurrentRoute() {
+    if (!isWalletRoute() || hasSummaryFallbackFetchSucceeded || isSummaryFallbackFetchInFlight) {
+      return;
+    }
+
+    isSummaryFallbackFetchInFlight = true;
+    try {
+      const response = await window.fetch(MOD_SUMMARY_URL_FRAGMENT, { credentials: "include" });
+      if (!response.ok) {
+        return;
+      }
+
+      const payload = await response.json();
+      rememberSummaryFromPayload(payload);
+      hasSummaryFallbackFetchSucceeded = true;
+    } catch (_) {
+      // Ignore network errors in fallback fetch.
+    } finally {
+      isSummaryFallbackFetchInFlight = false;
+    }
+  }
+
+  function applyWalletModCountFix() {
+    if (!isWalletRoute()) {
+      return;
+    }
+
+    const list = document.querySelector("#store-items ul.store-items");
+    if (!list) {
+      return;
+    }
+
+    removeWalletReportSeparators();
+
+    const rows = Array.from(list.children).filter((child) => child.tagName === "LI");
+    if (!rows.length) {
+      return;
+    }
+
+    let previousReportType = "";
+
+    for (const row of rows) {
+      const rowEntry = row.querySelector(".report_entry");
+      if (!rowEntry) {
+        continue;
+      }
+
+      const cells = Array.from(rowEntry.children).filter((child) => child.tagName === "SPAN");
+      if (cells.length < 2) {
+        continue;
+      }
+
+      const monthAnchor = cells[0].querySelector('a[href*="/reports/"]');
+      if (!monthAnchor) {
+        continue;
+      }
+
+      const parsed = parseYearAndMonthFromReportHref(monthAnchor.getAttribute("href"));
+      if (!parsed) {
+        continue;
+      }
+
+      const summaryData = summaryDataByYearAndMonth.get(makeYearAndMonthKey(parsed.year, parsed.month));
+      const reportType = summaryData?.reportType ?? "";
+      if (previousReportType && reportType && reportType !== previousReportType) {
+        list.insertBefore(createWalletReportSeparatorRow(), row);
+      }
+      if (reportType) {
+        previousReportType = reportType;
+      }
+
+      if (!summaryData || reportType !== "i20_game_pools") {
+        continue;
+      }
+
+      if (!Number.isInteger(summaryData.modCount)) {
+        continue;
+      }
+
+      const modCountCell = cells[1];
+      modCountCell.dataset.tmRawValue = String(summaryData.modCount);
+      modCountCell.textContent = numberFormatter.format(summaryData.modCount);
+    }
+  }
+
   function enhancePage() {
-    if (!isReportsRoute()) {
+    if (!isReportsRoute() && !isWalletRoute()) {
+      cleanupEnhancements();
       removeEnhancementNotice();
       return;
     }
@@ -1222,17 +1451,25 @@
     pauseObserver();
     isApplyingEnhancements = true;
     try {
-    if (!isEnhancementEligible()) {
-      cleanupEnhancements();
-      return;
-    }
+      ensureStyle();
 
-    ensureStyle();
-    upsertEnhancementNotice();
-    applyExtraColumns();
-    bindHeaderSorting();
-    applyModLinks();
-    sortRowsInPlace();
+      if (isReportsRoute()) {
+        if (!isEnhancementEligible()) {
+          cleanupEnhancements();
+          removeEnhancementNotice();
+          return;
+        }
+
+        upsertEnhancementNotice();
+        applyExtraColumns();
+        bindHeaderSorting();
+        applyModLinks();
+        sortRowsInPlace();
+      } else {
+        cleanupEnhancements();
+        upsertEnhancementNotice();
+        applyWalletModCountFix();
+      }
     } finally {
       isApplyingEnhancements = false;
       resumeObserver();
@@ -1278,6 +1515,7 @@
   window.addEventListener("hashchange", () => {
     scheduleEnhancement();
     fetchEntriesForCurrentRoute();
+    fetchSummaryForCurrentRoute();
   });
 
   if (document.readyState === "loading") {
@@ -1286,14 +1524,17 @@
       () => {
         scheduleEnhancement();
         fetchEntriesForCurrentRoute();
+        fetchSummaryForCurrentRoute();
       },
       { once: true },
     );
   } else {
     scheduleEnhancement();
     fetchEntriesForCurrentRoute();
+    fetchSummaryForCurrentRoute();
   }
 
   window.setTimeout(fetchEntriesForCurrentRoute, 1250);
+  window.setTimeout(fetchSummaryForCurrentRoute, 1250);
   startObserver();
 })();
