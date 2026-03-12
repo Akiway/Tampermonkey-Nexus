@@ -24,3 +24,4 @@ Direct raw links:
 
 ### mod-page
 - Adds a second chart on mod Stats pages to show monthly unique-download totals and month-over-month evolution.
+- New follower/endorser counters and lists in Logs tab

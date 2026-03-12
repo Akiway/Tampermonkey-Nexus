@@ -2,8 +2,8 @@
 // @name         Nexus Mods Enhancer - Mod Page
 // @namespace    https://github.com/Akiway
 // @author       Akiway
-// @version      1.0.0
-// @description  Adds a new chart on the Stats tab to show monthly unique-download totals and month-over-month evolution.
+// @version      1.1.0
+// @description  Adds a new chart on the Stats tab for unique downloads total and per month, add follower/endorser counters and list in Logs tab.
 // @match        https://www.nexusmods.com/cyberpunk2077/mods/*
 // @updateURL    https://github.com/Akiway/Tampermonkey-Nexus/raw/refs/heads/main/scripts/mod-page-ux.user.js
 // @downloadURL  https://github.com/Akiway/Tampermonkey-Nexus/raw/refs/heads/main/scripts/mod-page-ux.user.js
@@ -17,9 +17,17 @@
   const STYLE_ID = "tm-unique-dl-evolution-style";
   const SECTION_ID = "tm-unique-dl-evolution-section";
   const CONTAINER_ID = "tm-unique-dl-evolution-chart";
+  const TRACK_SUMMARY_ID = "tm-tracked-users-summary";
+  const TRACK_RECOUNT_ID = "tm-tracked-users-recount";
+  const USER_LIST_MODAL_BG_ID = "tm-user-list-modal-bg";
+  const USER_LIST_MODAL_WRAP_ID = "tm-user-list-modal-wrap";
+  const USER_LIST_POPUP_ID = "tm-user-list-popup";
   const NOTICE_ID = "tm-modpage-notice";
   const MAX_INIT_ATTEMPTS = 50;
   const RETRY_DELAY_MS = 350;
+  const TRACK_SCOPE = "users";
+  const TRACK_LOAD_TIMEOUT_MS = 7000;
+  const TRACK_MAX_LOAD_CYCLES = 400;
   const DEFAULT_GRAPH_WIDTH = 1260;
   const GRAPH_SECTION_PADDING = 40;
   const MIN_GRAPH_WIDTH = 320;
@@ -28,12 +36,23 @@
   let retryTimer = 0;
   let resizeTimer = 0;
   let isInitInProgress = false;
+  let isTrackCountInProgress = false;
   let chartInstance = null;
   let rootResizeObserver = null;
+  let activePopupKeyHandler = null;
+  const latestUserLists = {
+    tracked: [],
+    endorsed: [],
+  };
 
   function isStatsTab() {
     const queryTab = new URL(window.location.href).searchParams.get("tab");
     return queryTab === "stats";
+  }
+
+  function isLogsTab() {
+    const queryTab = new URL(window.location.href).searchParams.get("tab");
+    return queryTab === "logs";
   }
 
   function decodeJsString(value) {
@@ -237,6 +256,200 @@
         width: 100%;
         height: 100%;
         display: block;
+      }
+
+      #${TRACK_SUMMARY_ID} {
+        margin: 10px 0 18px;
+        padding: 10px 12px;
+        border-radius: 8px;
+        border: 1px solid var(--primary-subdued, #c87b28);
+        background: rgba(14, 14, 14, 0.45);
+        color: #e6e6e6;
+        font-size: 13px;
+        line-height: 1.4;
+      }
+
+      #${TRACK_SUMMARY_ID} .tm-track-disclaimer {
+        margin-bottom: 8px;
+        opacity: 0.85;
+        font-size: 12px;
+      }
+
+      #${TRACK_SUMMARY_ID} .tm-track-stats {
+        margin: 0;
+        padding: 0;
+        width: 100%;
+        list-style: none;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 14px 18px;
+      }
+
+      #${TRACK_SUMMARY_ID} .tm-track-stat {
+        min-width: 220px;
+        flex: 1 1 260px;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+      }
+
+      #${TRACK_SUMMARY_ID} .tm-track-stat .statitem {
+        min-width: 0;
+      }
+
+      #${TRACK_SUMMARY_ID} .tm-track-stat .titlestat {
+        margin: 0;
+        opacity: 0.85;
+        font-size: 13px;
+      }
+
+      #${TRACK_SUMMARY_ID} .tm-track-stat .stat {
+        margin: 0;
+        color: #ffffff;
+      }
+
+      #${TRACK_SUMMARY_ID} .tm-track-value {
+        font-size: 24px;
+        line-height: 1;
+        font-weight: 700;
+      }
+
+      #${TRACK_SUMMARY_ID} .tm-track-stat-link {
+        border: 0;
+        background: transparent;
+        color: var(--primary-moderate, #d98f40);
+        padding: 0;
+        margin: 0;
+        font: inherit;
+        cursor: pointer;
+        transition: color 225ms ease;
+      }
+
+      #${TRACK_SUMMARY_ID} .tm-track-stat-link:hover {
+        color: var(--primary-strong, #e0a362);
+      }
+
+      #${TRACK_SUMMARY_ID} .tm-track-stat-link:disabled {
+        color: #ffffff;
+        cursor: default;
+      }
+
+      #${TRACK_SUMMARY_ID} .tm-track-meta {
+        margin-top: 8px;
+        opacity: 0.85;
+        font-size: 12px;
+        pointer-events: none;
+      }
+
+      #${TRACK_SUMMARY_ID} .tm-track-actions {
+        margin-top: 8px;
+      }
+
+      #${TRACK_SUMMARY_ID} .tm-track-recount {
+        border: 1px solid var(--primary-moderate, #d98f40);
+        border-radius: 5px;
+        background: #1f1f1f;
+        color: #f1f1f1;
+        padding: 4px 10px;
+        font-size: 12px;
+        cursor: pointer;
+        transition: filter 225ms ease;
+      }
+
+      #${TRACK_SUMMARY_ID} .tm-track-recount:hover {
+        border-color: var(--primary-strong, #e0a362);
+        filter: brightness(120%);
+      }
+
+      #${TRACK_SUMMARY_ID} .tm-track-recount:disabled {
+        opacity: 0.5;
+        cursor: default;
+        filter: none;
+      }
+
+      #${TRACK_SUMMARY_ID} .tm-track-nav-icon {
+        display: inline-flex;
+        width: 26px;
+        height: 26px;
+        min-width: 26px;
+        min-height: 26px;
+        align-items: center;
+        justify-content: center;
+        font-size: 26px;
+        transform: scale(1.5);
+      }
+
+      #${TRACK_SUMMARY_ID} .tm-track-endorse-icon {
+        display: inline-flex;
+        width: 26px;
+        height: 26px;
+        min-width: 26px;
+        min-height: 26px;
+        align-items: center;
+        justify-content: center;
+        transform: scale(1.5);
+      }
+
+      #${TRACK_SUMMARY_ID} .tm-track-endorse-icon svg {
+        width: 100%;
+        height: 100%;
+        display: block;
+      }
+
+      #${USER_LIST_MODAL_BG_ID} {
+        position: fixed;
+        inset: 0;
+        background: rgba(0, 0, 0, 0.7);
+        z-index: 2147483645;
+      }
+
+      #${USER_LIST_MODAL_WRAP_ID} {
+        position: fixed;
+        inset: 0;
+        z-index: 2147483646;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 20px;
+      }
+
+      #${USER_LIST_POPUP_ID} {
+        width: min(620px, calc(100vw - 40px));
+        max-height: calc(100vh - 40px);
+        overflow: visible;
+      }
+
+      #${USER_LIST_POPUP_ID} .tm-popup-inner {
+        padding: 14px 16px 16px;
+      }
+
+      #${USER_LIST_POPUP_ID} h2 {
+        margin: 0 0 10px;
+        font-size: 20px;
+      }
+
+      #${USER_LIST_POPUP_ID} .user-list {
+        overflow-y: auto;
+        max-height: min(65vh, 520px);
+        margin: 0;
+      }
+
+      #${USER_LIST_POPUP_ID} .user-list li {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+      }
+
+      #${USER_LIST_POPUP_ID} .user-list img {
+        width: 32px;
+        height: 32px;
+        border-radius: 50%;
+        object-fit: cover;
+      }
+
+      #${USER_LIST_POPUP_ID} .tm-popup-empty {
+        margin: 0;
+        opacity: 0.8;
       }
     `;
 
@@ -595,6 +808,657 @@
     }
   }
 
+  function removeTrackedUsersSummary() {
+    const existing = document.getElementById(TRACK_SUMMARY_ID);
+    if (existing) {
+      existing.remove();
+    }
+    closeUserListPopup();
+  }
+
+  function upsertTrackedUsersSummary() {
+    const heading = document.querySelector(".tab-actionlog h2[data-game-id][data-mod-id]");
+    if (!heading) {
+      return null;
+    }
+
+    let summary = document.getElementById(TRACK_SUMMARY_ID);
+    if (!summary) {
+      summary = document.createElement("div");
+      summary.id = TRACK_SUMMARY_ID;
+      summary.innerHTML = `
+        <div class="tm-track-disclaimer">Disclaimer: Data estimated from logs available</div>
+        <ul class="stats clearfix tm-track-stats">
+          <li class="tm-track-stat">
+            <i class="nav-icon nav-icon-tracking tm-track-nav-icon" aria-hidden="true"></i>
+            <div class="statitem">
+              <div class="titlestat">Mod followers</div>
+              <div class="stat">
+                <button type="button" class="tm-track-stat-link" data-role="view-tracked" disabled>
+                  <span class="tm-track-value" data-role="current">-</span>
+                </button>
+              </div>
+            </div>
+          </li>
+          <li class="tm-track-stat">
+            <span class="tm-track-endorse-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" role="presentation" class="shrink-0" style="width: 1rem; height: 1rem;"><path d="M23,10C23,8.89 22.1,8 21,8H14.68L15.64,3.43C15.66,3.33 15.67,3.22 15.67,3.11C15.67,2.7 15.5,2.32 15.23,2.05L14.17,1L7.59,7.58C7.22,7.95 7,8.45 7,9V19A2,2 0 0,0 9,21H18C18.83,21 19.54,20.5 19.84,19.78L22.86,12.73C22.95,12.5 23,12.26 23,12V10M1,21H5V9H1V21Z" style="fill: currentcolor;"></path></svg>
+            </span>
+            <div class="statitem">
+              <div class="titlestat">Mod endorsers</div>
+              <div class="stat">
+                <button type="button" class="tm-track-stat-link" data-role="view-endorsed" disabled>
+                  <span class="tm-track-value" data-role="endorsed">-</span>
+                </button>
+              </div>
+            </div>
+          </li>
+          <li class="tm-track-stat">
+            <i class="nav-icon nav-icon-tracking tm-track-nav-icon" aria-hidden="true"></i>
+            <div class="statitem">
+              <div class="titlestat">Tracked at least once</div>
+              <div class="stat">
+                <span class="tm-track-value" data-role="ever">-</span>
+              </div>
+            </div>
+          </li>
+        </ul>
+        <div class="tm-track-meta" data-role="meta">Click "Caculate" to load all pages and count tracked and endorsed users.<br>This may take a few moments depending on mod popularity.</div>
+        <div class="tm-track-actions">
+          <button type="button" id="${TRACK_RECOUNT_ID}" class="tm-track-recount">Caculate</button>
+        </div>
+      `;
+      heading.insertAdjacentElement("afterend", summary);
+    }
+
+    const recountButton = summary.querySelector(`#${TRACK_RECOUNT_ID}`);
+    if (recountButton && recountButton.dataset.tmBound !== "1") {
+      recountButton.dataset.tmBound = "1";
+      recountButton.addEventListener("click", () => {
+        void updateTrackedUsersSummary({ forceReload: true });
+      });
+    }
+
+    const trackedViewButton = summary.querySelector('[data-role="view-tracked"]');
+    if (trackedViewButton && trackedViewButton.dataset.tmBound !== "1") {
+      trackedViewButton.dataset.tmBound = "1";
+      trackedViewButton.addEventListener("click", () => {
+        openUserListPopup("tracked");
+      });
+    }
+
+    const endorsedViewButton = summary.querySelector('[data-role="view-endorsed"]');
+    if (endorsedViewButton && endorsedViewButton.dataset.tmBound !== "1") {
+      endorsedViewButton.dataset.tmBound = "1";
+      endorsedViewButton.addEventListener("click", () => {
+        openUserListPopup("endorsed");
+      });
+    }
+
+    return summary;
+  }
+
+  function setTrackedUsersSummary(summary, values) {
+    if (!summary) {
+      return;
+    }
+
+    const trackedCurrent = values?.trackedCurrent ?? "-";
+    const trackedEver = values?.trackedEver ?? "-";
+    const endorsedCurrent = values?.endorsedCurrent ?? "-";
+    const metaText = values?.metaText ?? "";
+    const trackedUsers = Array.isArray(values?.trackedUsers) ? values.trackedUsers : null;
+    const endorsedUsers = Array.isArray(values?.endorsedUsers) ? values.endorsedUsers : null;
+    const listsLoaded = values?.listsLoaded === true;
+
+    const currentValue = summary.querySelector('[data-role="current"]');
+    const everValue = summary.querySelector('[data-role="ever"]');
+    const endorsedValue = summary.querySelector('[data-role="endorsed"]');
+    const metaValue = summary.querySelector('[data-role="meta"]');
+    const trackedViewButton = summary.querySelector('[data-role="view-tracked"]');
+    const endorsedViewButton = summary.querySelector('[data-role="view-endorsed"]');
+
+    if (currentValue) {
+      currentValue.textContent = String(trackedCurrent);
+    }
+    if (everValue) {
+      everValue.textContent = String(trackedEver);
+    }
+    if (endorsedValue) {
+      endorsedValue.textContent = String(endorsedCurrent);
+    }
+    if (metaValue) {
+      metaValue.textContent = metaText;
+    }
+
+    if (trackedUsers) {
+      latestUserLists.tracked = trackedUsers;
+    }
+    if (endorsedUsers) {
+      latestUserLists.endorsed = endorsedUsers;
+    }
+
+    if (trackedViewButton) {
+      trackedViewButton.disabled = !listsLoaded;
+    }
+    if (endorsedViewButton) {
+      endorsedViewButton.disabled = !listsLoaded;
+    }
+  }
+
+  function closeUserListPopup() {
+    const popupBg = document.getElementById(USER_LIST_MODAL_BG_ID);
+    const popupWrap = document.getElementById(USER_LIST_MODAL_WRAP_ID);
+    if (popupBg) {
+      popupBg.remove();
+    }
+    if (popupWrap) {
+      popupWrap.remove();
+    }
+
+    if (activePopupKeyHandler) {
+      document.removeEventListener("keydown", activePopupKeyHandler, true);
+      activePopupKeyHandler = null;
+    }
+  }
+
+  function normalizeDisplayName(name, fallback) {
+    const value = String(name ?? "").replace(/\s+/g, " ").trim();
+    if (value) {
+      return value;
+    }
+    return String(fallback ?? "Unknown user");
+  }
+
+  function createUserListItem(user) {
+    const li = document.createElement("li");
+    li.className = "clearfix";
+
+    const img = document.createElement("img");
+    img.src = String(user.avatarUrl ?? "").trim() || "https://www.nexusmods.com/assets/images/default-no-profile-picture.svg";
+    img.alt = "";
+    li.appendChild(img);
+
+    const details = document.createElement("div");
+    details.className = "user-list-details";
+
+    const link = document.createElement("a");
+    link.className = "user-list-name";
+    link.href = String(user.profileHref ?? "").trim() || "#";
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    link.textContent = normalizeDisplayName(user.userName, user.userId);
+    details.appendChild(link);
+
+    li.appendChild(details);
+    return li;
+  }
+
+  function openUserListPopup(type) {
+    closeUserListPopup();
+
+    const users = type === "endorsed" ? latestUserLists.endorsed : latestUserLists.tracked;
+    const baseTitle = type === "endorsed" ? "Mod endorsers" : "Mod followers";
+    const title = `${baseTitle} (${users.length})`;
+
+    const bg = document.createElement("div");
+    bg.id = USER_LIST_MODAL_BG_ID;
+    bg.addEventListener("click", closeUserListPopup);
+
+    const wrap = document.createElement("div");
+    wrap.id = USER_LIST_MODAL_WRAP_ID;
+    wrap.addEventListener("click", (event) => {
+      if (event.target === wrap) {
+        closeUserListPopup();
+      }
+    });
+
+    const popup = document.createElement("div");
+    popup.id = USER_LIST_POPUP_ID;
+    popup.className = "popup-bugreport popup mfp-with-anim col-1-1";
+    popup.innerHTML = `
+      <div class="col-1-1 tm-popup-inner">
+        <h2>${title}</h2>
+        <div class="clearfix">
+          <ul class="user-list"></ul>
+          <p class="tm-popup-empty" style="display:none;">No users to display.</p>
+        </div>
+      </div>
+      <button title="Close (Esc)" type="button" class="mfp-close">×</button>
+    `;
+
+    const list = popup.querySelector(".user-list");
+    const empty = popup.querySelector(".tm-popup-empty");
+    if (list) {
+      if (users.length) {
+        for (const user of users) {
+          list.appendChild(createUserListItem(user));
+        }
+      } else if (empty) {
+        empty.style.display = "";
+      }
+    }
+
+    const closeButton = popup.querySelector(".mfp-close");
+    closeButton?.addEventListener("click", closeUserListPopup);
+
+    wrap.appendChild(popup);
+    document.body.appendChild(bg);
+    document.body.appendChild(wrap);
+
+    activePopupKeyHandler = (event) => {
+      if (event.key === "Escape") {
+        closeUserListPopup();
+      }
+    };
+    document.addEventListener("keydown", activePopupKeyHandler, true);
+  }
+
+  function getLogsRouteIds() {
+    const heading = document.querySelector(".tab-actionlog h2[data-game-id][data-mod-id]");
+    const gameId = Number.parseInt(String(heading?.getAttribute("data-game-id") ?? ""), 10);
+    const modId = Number.parseInt(String(heading?.getAttribute("data-mod-id") ?? ""), 10);
+
+    if (!Number.isInteger(modId) || !Number.isInteger(gameId)) {
+      return null;
+    }
+
+    return { modId, gameId };
+  }
+
+  function getUsersLoadButton() {
+    return document.getElementById("ModActionLogExpanderLoadButtonusers");
+  }
+
+  function getUsersLogContainer() {
+    const loadButtonContainer = getUsersLoadButton()?.closest("dd.act-log-container");
+    if (loadButtonContainer) {
+      return loadButtonContainer;
+    }
+
+    const scripts = Array.from(document.querySelectorAll(".tab-actionlog dd.act-log-container script"));
+    for (const script of scripts) {
+      const text = String(script.textContent ?? "");
+      if (!text.includes("actionLogOffset['users']") && !text.includes('actionLogOffset["users"]')) {
+        continue;
+      }
+
+      const scriptContainer = script.closest("dd.act-log-container");
+      if (scriptContainer) {
+        return scriptContainer;
+      }
+    }
+
+    const dtElements = Array.from(document.querySelectorAll(".tab-actionlog dl.accordion > dt"));
+    for (const dt of dtElements) {
+      const label = String(dt.textContent ?? "").replace(/\s+/g, " ").trim().toLowerCase();
+      if (!label.includes("mod page activity")) {
+        continue;
+      }
+
+      if (dt.nextElementSibling?.tagName === "DD") {
+        return dt.nextElementSibling;
+      }
+    }
+
+    return null;
+  }
+
+  function getUsersActionItems(container = getUsersLogContainer()) {
+    if (!container) {
+      return [];
+    }
+
+    return Array.from(container.querySelectorAll("ul.action-log > li"));
+  }
+
+  function getUserInfoFromItem(item) {
+    const userLink = item?.querySelector('.log-modified a[href*="/users/"]');
+    const href = String(userLink?.getAttribute("href") ?? "");
+    const hrefMatch = href.match(/\/users\/(\d+)(?:[/?#]|$)/);
+    const userName = String(userLink?.textContent ?? "")
+      .replace(/\s+/g, " ")
+      .trim();
+    const normalizedName = userName.toLowerCase();
+
+    const userId = hrefMatch?.[1] ? Number.parseInt(hrefMatch[1], 10) : null;
+    const profileHref = (() => {
+      if (!href) {
+        return "";
+      }
+      if (/^https?:\/\//i.test(href)) {
+        return href;
+      }
+      if (href.startsWith("/")) {
+        return `${window.location.origin}${href}`;
+      }
+      return `${window.location.origin}/${href}`;
+    })();
+
+    if (!Number.isInteger(userId) && !normalizedName) {
+      return null;
+    }
+
+    return {
+      idKey: Number.isInteger(userId) ? `u:${userId}` : `n:${normalizedName}`,
+      userId: Number.isInteger(userId) ? userId : null,
+      userName,
+      profileHref,
+      avatarUrl: Number.isInteger(userId) ? `https://avatars.nexusmods.com/${userId}/100` : "",
+    };
+  }
+
+  function getActionTypeFromItem(item) {
+    const actionTitle = String(item?.querySelector(".log-change h4")?.textContent ?? "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .toLowerCase();
+    if (!actionTitle) {
+      return "";
+    }
+
+    if (actionTitle.includes("untracked")) {
+      return "untracked";
+    }
+    if (actionTitle.includes("tracked")) {
+      return "tracked";
+    }
+    if (actionTitle.includes("unendors")) {
+      return "unendorsed";
+    }
+    if (actionTitle.includes("endorsed")) {
+      return "endorsed";
+    }
+
+    return "";
+  }
+
+  function collectUserActionEvents(container = getUsersLogContainer()) {
+    const events = [];
+    for (const item of getUsersActionItems(container)) {
+      const action = getActionTypeFromItem(item);
+      if (!action) {
+        continue;
+      }
+
+      const user = getUserInfoFromItem(item);
+      if (!user?.idKey) {
+        continue;
+      }
+
+      events.push({ user, action });
+    }
+
+    return events;
+  }
+
+  function computeUserActionStats(events) {
+    const everTrackedUsers = new Set();
+    const latestTrackStateByUser = new Map();
+    const latestEndorseStateByUser = new Map();
+
+    // The log list is newest-first, so first action seen per user is the current state.
+    for (const event of events) {
+      const userKey = event.user.idKey;
+
+      if (event.action === "tracked") {
+        everTrackedUsers.add(userKey);
+      }
+
+      if (
+        (event.action === "tracked" || event.action === "untracked") &&
+        !latestTrackStateByUser.has(userKey)
+      ) {
+        latestTrackStateByUser.set(userKey, {
+          active: event.action === "tracked",
+          user: event.user,
+        });
+      }
+
+      if (
+        (event.action === "endorsed" || event.action === "unendorsed") &&
+        !latestEndorseStateByUser.has(userKey)
+      ) {
+        latestEndorseStateByUser.set(userKey, {
+          active: event.action === "endorsed",
+          user: event.user,
+        });
+      }
+    }
+
+    const currentTrackedUsers = [];
+    for (const state of latestTrackStateByUser.values()) {
+      if (state.active) {
+        currentTrackedUsers.push(state.user);
+      }
+    }
+
+    const currentEndorsedUsers = [];
+    for (const state of latestEndorseStateByUser.values()) {
+      if (state.active) {
+        currentEndorsedUsers.push(state.user);
+      }
+    }
+
+    return {
+      currentTrackedUsers,
+      everTrackedUsers: everTrackedUsers.size,
+      currentEndorsedUsers,
+    };
+  }
+
+  function delay(ms) {
+    return new Promise((resolve) => {
+      window.setTimeout(resolve, ms);
+    });
+  }
+
+  async function waitForCondition(check, timeoutMs, stepMs) {
+    const startAt = Date.now();
+    while (Date.now() - startAt < timeoutMs) {
+      if (check()) {
+        return true;
+      }
+      await delay(stepMs);
+    }
+    return false;
+  }
+
+  function getUsersOffsetToken() {
+    try {
+      return String(window.actionLogOffset?.[TRACK_SCOPE] ?? "");
+    } catch (_) {
+      return "";
+    }
+  }
+
+  async function loadAllUsersLogPages(modId, gameId, { onProgress } = {}) {
+    if (typeof window.LoadMoreModActionLogItems !== "function") {
+      return { loadedPages: 0, usedNativeLoader: false };
+    }
+
+    let loadedPages = 0;
+    let cycles = 0;
+    const seenOffsets = new Set();
+    const initialOffset = getUsersOffsetToken();
+    if (initialOffset) {
+      seenOffsets.add(initialOffset);
+    }
+    if (typeof onProgress === "function") {
+      onProgress(loadedPages);
+    }
+
+    while (cycles < TRACK_MAX_LOAD_CYCLES) {
+      cycles += 1;
+      const loadButton = getUsersLoadButton();
+      if (!loadButton) {
+        break;
+      }
+
+      const beforeCount = getUsersActionItems().length;
+      const beforeOffset = getUsersOffsetToken();
+
+      window.LoadMoreModActionLogItems(modId, gameId, TRACK_SCOPE);
+
+      const completed = await waitForCondition(() => {
+        const afterOffset = getUsersOffsetToken();
+        const hasButton = Boolean(getUsersLoadButton());
+        return !hasButton || (afterOffset !== "" && afterOffset !== beforeOffset);
+      }, TRACK_LOAD_TIMEOUT_MS, 120);
+
+      if (!completed) {
+        break;
+      }
+
+      const hasButton = Boolean(getUsersLoadButton());
+      const afterOffset = getUsersOffsetToken();
+      if (hasButton && afterOffset === beforeOffset) {
+        break;
+      }
+
+      if (afterOffset && seenOffsets.has(afterOffset)) {
+        break;
+      }
+      if (afterOffset) {
+        seenOffsets.add(afterOffset);
+      }
+
+      const afterCount = getUsersActionItems().length;
+      if (afterCount > beforeCount) {
+        loadedPages += 1;
+        if (typeof onProgress === "function") {
+          onProgress(loadedPages);
+        }
+      }
+
+      await delay(140);
+    }
+
+    return { loadedPages, usedNativeLoader: true };
+  }
+
+  async function updateTrackedUsersSummary({ forceReload = false } = {}) {
+    if (isTrackCountInProgress) {
+      return;
+    }
+
+    const summary = upsertTrackedUsersSummary();
+    if (!summary) {
+      scheduleRetry();
+      return;
+    }
+
+    if (!forceReload && summary.dataset.tmTrackReady === "1") {
+      return;
+    }
+
+    const recountButton = summary.querySelector(`#${TRACK_RECOUNT_ID}`);
+    if (recountButton) {
+      recountButton.disabled = true;
+    }
+
+    isTrackCountInProgress = true;
+    try {
+      const ids = getLogsRouteIds();
+      if (!ids) {
+        setTrackedUsersSummary(summary, {
+          trackedCurrent: "-",
+          trackedEver: "-",
+          endorsedCurrent: "-",
+          metaText: "Unable to resolve mod/game ids.",
+          trackedUsers: [],
+          endorsedUsers: [],
+          listsLoaded: false,
+        });
+        return;
+      }
+
+      const usersContainer = getUsersLogContainer();
+      if (!usersContainer) {
+        setTrackedUsersSummary(summary, {
+          trackedCurrent: "...",
+          trackedEver: "...",
+          endorsedCurrent: "...",
+          metaText: "Waiting for activity log data...",
+          listsLoaded: false,
+        });
+        return;
+      }
+
+      setTrackedUsersSummary(summary, {
+        trackedCurrent: "...",
+        trackedEver: "...",
+        endorsedCurrent: "...",
+        metaText: "Loading all log pages... 0 extra page(s) loaded.",
+        listsLoaded: false,
+      });
+      const loadResult = await loadAllUsersLogPages(ids.modId, ids.gameId, {
+        onProgress(loadedPages) {
+          setTrackedUsersSummary(summary, {
+            trackedCurrent: "...",
+            trackedEver: "...",
+            endorsedCurrent: "...",
+            metaText: `Loading all log pages... ${loadedPages} extra page(s) loaded.`,
+            listsLoaded: false,
+          });
+        },
+      });
+
+      const entriesCount = getUsersActionItems(usersContainer).length;
+      if (!entriesCount) {
+        setTrackedUsersSummary(summary, {
+          trackedCurrent: "...",
+          trackedEver: "...",
+          endorsedCurrent: "...",
+          metaText: "Waiting for activity log entries...",
+          listsLoaded: false,
+        });
+        return;
+      }
+
+      const events = collectUserActionEvents(usersContainer);
+      if (!events.length) {
+        setTrackedUsersSummary(summary, {
+          trackedCurrent: 0,
+          trackedEver: 0,
+          endorsedCurrent: 0,
+          metaText: `Analyzed ${entriesCount} log entries. No tracked/endorsed events found.`,
+          trackedUsers: [],
+          endorsedUsers: [],
+          listsLoaded: true,
+        });
+        summary.dataset.tmTrackReady = "1";
+        return;
+      }
+
+      const stats = computeUserActionStats(events);
+      setTrackedUsersSummary(summary, {
+        trackedCurrent: stats.currentTrackedUsers.length,
+        trackedEver: stats.everTrackedUsers,
+        endorsedCurrent: stats.currentEndorsedUsers.length,
+        metaText: `Analyzed ${entriesCount} log entries. Loaded ${loadResult.loadedPages} extra page(s).`,
+        trackedUsers: stats.currentTrackedUsers,
+        endorsedUsers: stats.currentEndorsedUsers,
+        listsLoaded: true,
+      });
+      summary.dataset.tmTrackReady = "1";
+    } catch (error) {
+      setTrackedUsersSummary(summary, {
+        trackedCurrent: "-",
+        trackedEver: "-",
+        endorsedCurrent: "-",
+        metaText: "Failed to compute tracked users.",
+        listsLoaded: false,
+      });
+      console.error("[TM Mod Page] Track counter error", error);
+    } finally {
+      isTrackCountInProgress = false;
+      if (recountButton) {
+        recountButton.disabled = false;
+      }
+    }
+  }
+
   function bindRootWidthObserver() {
     if (typeof window.ResizeObserver !== "function") {
       return;
@@ -640,20 +1504,32 @@
       return;
     }
 
-    if (!isStatsTab()) {
+    const onStatsTab = isStatsTab();
+    const onLogsTab = isLogsTab();
+
+    if (!onStatsTab && !onLogsTab) {
       removeEnhancementNotice();
+      removeTrackedUsersSummary();
       return;
     }
 
     isInitInProgress = true;
     try {
+      ensureStyle();
+      upsertEnhancementNotice();
+
+      if (onLogsTab) {
+        upsertTrackedUsersSummary();
+        return;
+      }
+
+      removeTrackedUsersSummary();
+
       if (!window.Highcharts || typeof window.Highcharts.stockChart !== "function") {
         scheduleRetry();
         return;
       }
 
-      ensureStyle();
-      upsertEnhancementNotice();
       const container = ensureMountPoint();
       if (!container) {
         scheduleRetry();
@@ -701,7 +1577,9 @@
     void init();
 
     const observer = new MutationObserver(() => {
-      if (!document.getElementById(SECTION_ID)) {
+      const needsStatsEnhancement = isStatsTab() && !document.getElementById(SECTION_ID);
+      const needsLogsEnhancement = isLogsTab() && !document.getElementById(TRACK_SUMMARY_ID);
+      if (needsStatsEnhancement || needsLogsEnhancement) {
         void init();
       }
     });
